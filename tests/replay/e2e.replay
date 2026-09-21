@@ -1,0 +1,75 @@
+# Memoria del Hielo — 端到端工作流重放
+# 模拟完整：导入 → tag管理 → 搜索 → 清理
+# 使用 @save 跨步骤传递变量
+#
+# 用法:
+#   python tools/mcp_replay.py --replay tests/replay/e2e.replay
+
+# ── 1. 初始化 ────────────────────────────────────────
+@label Init
+@delay 200
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"0.1.0","capabilities":{},"clientInfo":{"name":"mcp-e2e-test","version":"1.0"}}}
+
+# ── 2. 工具列表 ──────────────────────────────────────
+@label ListTools
+@delay 200
+{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}
+
+# ── 3. 搜索（看看已有数据）──────────────────────────
+@label SearchBefore
+@delay 300
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"search_docs","arguments":{"query":"神经网络","limit":5}}}
+
+# ── 4. 导入聊天文件（如有，需要真实路径）────────────
+# 注释掉以防不存在：
+# @label ImportChat
+# @save chat_guid
+# @delay 500
+# {"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"import_chat","arguments":{"path":"<对话目录>/示例.md","tags":"测试","no_clean":false,"summary":"示例对话摘要"}}}
+
+# ── 5. 用 tag 管理查看导入的文档 ────────────────────
+# 注释掉，因为需要真实 guid：
+# @label TagLookup
+# @delay 200
+# {"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"manage_tags_tool","arguments":{"guid":"{{chat_guid}}","category":"chat","add":"重要,技术"}}}
+
+# ── 6. 搜索刚导入的内容 ─────────────────────────────
+# @label SearchAfter
+# @delay 300
+# {"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"search_docs","arguments":{"query":"示例","tags":"测试","limit":5}}}
+
+# ── 7. 图片清理（只列出）───────────────────────────
+@label ListOrphans
+@delay 200
+{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"cleanup_images_tool","arguments":{}}}
+
+# ── 8. 搜索英文（走 content 列）────────────────────
+@label EngSearch
+@delay 300
+{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"search_docs","arguments":{"query":"python async","limit":3}}}
+
+# ── 9. 搜索中文（走 content_tokenized 列 + 向量）──
+@label CJKSearch
+@delay 300
+{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"search_docs","arguments":{"query":"内存泄漏分析","limit":3}}}
+
+# ── 10. 纯向量搜索 ─────────────────────────────────
+@delay 300
+{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"search_docs","arguments":{"query":"缓存策略","vector_only":true,"limit":5}}}
+
+# ── 11. 纯全文搜索（中文 — 走 content_tokenized）──
+@delay 300
+{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"search_docs","arguments":{"query":"性能优化","fulltext_only":true,"limit":5}}}
+
+# ── 12. 限定桶搜索 ────────────────────────────────
+@delay 300
+{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"search_docs","arguments":{"query":"python","bucket":"AI对话","limit":3}}}
+
+# ── 13. 干净聊天（文件不存在 — 测试错误处理）──────
+@label CleanChat
+@delay 200
+{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"clean_chat_tool","arguments":{"input_path":"/tmp/nonexistent.md","with_summary":true}}}
+
+# ── 结束 ────────────────────────────────────────────
+@delay 100
+{"jsonrpc":"2.0","id":14,"method":"notifications/exit","params":{}}

@@ -1,0 +1,77 @@
+# config.toml.example —— 复制为 config.toml 后按自己环境改。
+# 真实配置(config.toml)永不进仓库：它含数据库密码。
+# ============================================================
+# Memoria del Hielo — 配置文件（供参考原型）
+# ============================================================
+# 密码优先级：password 字段 > 环境变量 MHI_DB_PASSWORD
+#   留空时从环境变量读取；非空则优先使用 config.toml 中的值
+
+[database]
+host = "127.0.0.1"           # ⚠️ 不能写 localhost（MariaDB 解析到 Unix socket）
+port = 9002
+name = "memoria_del_hielo"
+user = "mhi_user"
+# 密码优先级：下列 password 字段（非空）> 环境变量 MHI_DB_PASSWORD
+# password = "在这里填你的数据库密码（或设环境变量 MHI_DB_PASSWORD）"
+
+[embedding]
+model = "remote:BAAI/bge-m3"
+dimension = 1024
+local_endpoint = "http://127.0.0.1:9005/v1/embeddings"
+remote_endpoint = "http://127.0.0.1:9006/v1/embeddings"
+rerank_local = "http://127.0.0.1:9005/v1/rerank"
+rerank_remote = "http://127.0.0.1:9006/v1/rerank"
+# 可在 model 字段中加 "local:" 或 "remote:" 前缀；rerank_model 仅写模型名
+rerank_model = "remote:BAAI/bge-reranker-v2-m3"
+
+[ocr]
+endpoint = "http://127.0.0.1:9008/ocr"     # HTTP 模式
+# endpoint = "pipe"                          # stdin/stdout 管道模式
+lang = "ch"
+# OCR 语言降级链（逗号分割）：server_paddle 按链识别，首个文本非空且
+# 平均置信度 ≥ 阈值（server 侧 --lang-confidence，默认 0.6）的语言胜出。
+# 混排书（中文书里的英文图表/拉丁书里的希腊引文）才触发降级，成本可控。
+lang_chain = "ch,en,la,el,ru"
+# MinerU layout 判据：这些类型的图跳过 OCR（照片/插图/公式——MinerU 的
+# layout 模型已分类证明无文字价值），但仍 MD5 去重/登记。空 = 不跳过。
+# 白名单直觉：table/chart 有文字必 OCR；image/equation_interline 跳过。
+skip_image_types = "image,equation_interline"
+
+[everything]
+http_url = "http://localhost:9000/"
+
+[images]
+storage_dir = "images"          # 相对于项目根目录，图片存为 {md5} 无扩展名
+ocr_enabled = true
+
+[cache]
+# 嵌入向量缓存（MariaDB embedding_cache 表，主键 text_hash+model）
+dir = "cache"                   # 旧 JSONL 路径（仅迁移脚本用）
+ttl_days = 180                  # 缓存有效期（天）；0 = 永不过期
+
+[import]
+default_bucket_onenote = "OneNote笔记"
+default_bucket_clipping = "剪报"
+default_bucket_book = "图书"
+default_bucket_game = "游戏剧情"
+default_bucket_chat = "AI对话"
+
+[chunking]
+# 书桶切块（chunk 层）。max_chars 硬上限受 BGE-M3 8192 token 物理约束：
+# 最坏 ~2 token/字符 → 2500 字符 = 5000 token，2 倍安全余量。
+target_chars = 2000     # 打包软目标（字符）
+max_chars = 2500        # 硬上限：超限必切
+min_chars = 400         # 尾部微块并入前一块的阈值
+overlap_chars = 300     # 超长节内切分时相邻 piece 的重叠
+embed_batch_size = 32   # 批量嵌入每批 chunk 数
+max_per_book = 3        # 搜索结果单书最多展示 chunk 数
+# ── 搜索 ────────────────────────────────────────────────
+[search]
+# 默认查找 tag（逗号分割）：search_docs / mhi-search 未显式传 --tags 时生效。
+# 优先级：显式 tags > MCP 本场会话 set_default_tags > 此配置。
+#
+# 特殊值 OMNIA = 「搜全部数据」哨兵（推荐默认）：与留空/空串同义，都不生成 tag 谓词。
+#   OMNIA 永不落库（写入侧一律拦截），也不得与具体 tag 混用——"OMNIA,化学" 报错：
+#   ALL OR <tag> 恒等于 ALL，无意义。语义权威定义见 src/core/tags.py。
+# 留空 = 不过滤（与 OMNIA 同义）。示例：default_tags = "地质学,<corpus-root>"
+default_tags = "OMNIA"

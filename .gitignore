@@ -1,0 +1,40 @@
+# Memoria del Hielo — .gitignore
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# 缓存（嵌入向量缓存不提交，但保留目录结构）
+cache/
+!cache/.gitkeep
+
+# 图片存储（本地资源不提交）
+images/
+!images/.gitkeep
+
+# 环境配置（含密码等敏感信息）
+.env
+*.env.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# pytest
+.pytest_cache/

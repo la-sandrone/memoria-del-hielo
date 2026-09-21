@@ -1,0 +1,57 @@
+# Memoria del Hielo — 冒烟测试重放
+# 验证 MCP Server 所有核心功能
+#
+# 用法:
+#   python tools/mcp_replay.py --replay tests/replay/smoke.replay
+
+# ── 1. 初始化 ────────────────────────────────────────
+# 必须先发 initialize
+@label Init
+@delay 200
+{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"0.1.0","capabilities":{},"clientInfo":{"name":"mcp-smoke-test","version":"1.0"}}}
+
+# ── 2. 工具列表 ──────────────────────────────────────
+@label ListTools
+@delay 300
+{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}
+
+# ── 3. 搜索（空结果 — 数据库可能是空的，测试不崩就行）──
+@label Search
+@delay 500
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"search_docs","arguments":{"query":"测试","limit":3}}}
+
+# ── 4. 搜索（英文 — 走 content 列）────────────────
+@delay 300
+{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"search_docs","arguments":{"query":"python","limit":3}}}
+
+# ── 5. 搜索（中文 — 走 content_tokenized 列 + 向量）──
+@label CJKSearch
+@delay 300
+{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"search_docs","arguments":{"query":"神经网络","category":"book","limit":5}}}
+
+# ── 6. 单独全文搜索 ─────────────────────────────────
+@delay 300
+{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"search_docs","arguments":{"query":"Redis 缓存","fulltext_only":true,"limit":3}}}
+
+# ── 7. 单独向量搜索 ─────────────────────────────────
+@delay 300
+{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"search_docs","arguments":{"query":"分布式系统","vector_only":true,"limit":3}}}
+
+# ── 8. Tag 管理（查一个不存在的 guid，测试错误处理）──
+@label TagTest
+@delay 200
+{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"manage_tags_tool","arguments":{"guid":"00000000-0000-0000-0000-000000000000","category":"book"}}}
+
+# ── 9. 图片清理（列出孤儿图片）──────────────────────
+@label Cleanup
+@delay 200
+{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"cleanup_images_tool","arguments":{}}}
+
+# ── 10. 导入聊天（带清洗，文件不存在 -> 测试错误处理）
+@label ImportChat
+@delay 300
+{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"import_chat","arguments":{"path":"/tmp/nonexistent_chat.md","tags":"测试","no_clean":true}}}
+
+# ── 结束 ────────────────────────────────────────────
+@delay 100
+{"jsonrpc":"2.0","id":11,"method":"notifications/exit","params":{}}

@@ -1,0 +1,1 @@
+# Memoria del Hielo — 核心共享模块

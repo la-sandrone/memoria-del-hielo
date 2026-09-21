@@ -1,0 +1,73 @@
+# Memoria del Hielo — 项目元数据（供参考原型）
+# 依赖项按需安装，此处列出完整依赖集用于 uv sync / pip install
+
+[project]
+name = "memoria-del-hielo"
+version = "0.1.0"
+description = "Memoria del Hielo — 冻原记忆：MariaDB 驱动的私有知识库"
+requires-python = ">=3.12"
+dependencies = [
+    # 数据库
+    "mariadb>=1.1",
+    # 配置文件
+    "tomli>=2; python_version < '3.11'",   # Python 3.11+ 自带 tomllib
+    # 嵌入（调用 server_bge.py HTTP API）
+    "httpx>=0.27",
+    # 图片处理
+    "Pillow>=10",
+    "numpy>=1.26",
+    # 文本处理
+    "jieba>=0.42",
+    # 编码检测（对话清洗）
+    "chardet>=5",
+    # UAX#29 字素簇（\X；切点完整性下界）
+    "regex>=2024.5.15",
+    # CLI
+    "click>=8",
+    # 并行进度表格（仅 tty 时启用，非终端自动降级纯文本）
+    "rich>=13.9",
+    # UUID
+    # 标准库 uuid 模块即可
+    # MCP Server（⚠️ 代码里 import 的是 fastmcp，不是 mcp——少哪个都起不来）
+    "mcp>=1.0",
+    "fastmcp>=3",
+    # MinerU 后处理里直接用了 requests（其余 HTTP 一律走 httpx）
+    "requests>=2.31",
+    # 图片搜索（Everything HTTP 客户端）
+    # 直接用 httpx，无需额外依赖
+]
+
+[project.optional-dependencies]
+# PDF 提取（懒加载：只有真的导入 PDF 时才 import fitz）
+pdf = ["PyMuPDF>=1.24"]
+# EPUB 提取（懒加载）
+epub = ["ebooklib>=0.18"]
+# 常驻嵌入 & 重排服务 server_bge.py 自己的依赖（服务端才装，核心用不着）
+embed = [
+    "fastapi>=0.110",
+    "uvicorn>=0.27",
+    "pydantic>=2",
+    "sentence-transformers>=3",
+    "torch>=2",
+]
+# OCR 服务端 server_paddle.py 侧（不是本项目核心依赖）
+# ⚠️ 要用 GPU 的话单独装 paddlepaddle-gpu，别让 pip 拉默认的 CPU 版
+ocr = ["paddleocr>=3.7", "paddlepaddle>=3.0"]
+# 开发
+dev = ["pytest>=8", "pytest-asyncio>=0.24"]
+
+[project.scripts]
+mhi-import-book = "src.cli.mhi_import_book:main"
+mhi-import-chat = "src.cli.mhi_import_chat:main"
+mhi-import-onenote = "src.cli.mhi_import_onenote:main"
+mhi-clean-chat = "src.cli.mhi_clean_chat:main"
+mhi-search = "src.cli.mhi_search:main"
+mhi-tag = "src.cli.mhi_tag:main"
+mhi-cleanup-images = "src.cli.mhi_cleanup_images:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
