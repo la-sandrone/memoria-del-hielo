@@ -5,7 +5,7 @@
 > 之前遇到个神奇的AI客户端，知识库后台是某个老版魔改版libsql，结果库大了检索五分钟，还不给单独搜索页面。
 > 正好作为Discuz! 5.X时代就来的老登，对MariaDB这套东西还算熟悉，遂用MCP Tool Call外加MariaDB的向量搜索以及BGE模型之类的东西攒了一套玩具工具。
 > **纯娱乐，不保证能长期用啊，更新看我自己需求。**
-> 充分学习PECMD和PECMD2012（https://bbs.wuyou.net/forum.php?mod=viewthread&tid=205402）精神：短小精干，运行迅速（虽然我这里本质是大量复用已有轮子，悲）
+> 充分学习PECMD和PECMD2012（ https://bbs.wuyou.net/forum.php?mod=viewthread&tid=205402 ）精神：短小精干，运行迅速（虽然我这里本质是大量复用已有轮子，悲）
 
 ## 具体发生了什么
 
