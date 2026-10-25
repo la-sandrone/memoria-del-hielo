@@ -21,7 +21,7 @@ from .config import get_config
 from .db import get_db
 from .embedding import get_embedding_service
 from .tags import normalize_query_tags, split_tags
-from .tokenizer import tokenize_query, has_cjk
+from .tokenizer import build_cjk_boolean, has_cjk, tokenize_query
 
 # 搜索表配置（book 走 chunk 表专用路径，不在此列）
 SEARCHABLE_TABLES = [
@@ -390,7 +390,9 @@ class SearchEngine:
         CJK 查询 → jieba 分词后搜 content_tokenized 列（布尔模式）
         非 CJK   → 搜 content 列（布尔模式）
         """
-        tokens = tokenize_query(query)
+        # CJK 走 unigram+bigram（与 content_tokenized 的写入口径一致）；
+        # 非 CJK 仍走原分词（那些列存的是整词，未 bigram 化）
+        tokens = build_cjk_boolean(query) if is_cjk else tokenize_query(query)
         if not tokens.strip():
             return []
 
@@ -445,6 +447,28 @@ class SearchEngine:
         JOIN 会让向量索引失效、走精确扫描——但精确扫描在 8G 缓冲池下已是 0.4s，
         且结果是精确 KNN（无近似损失、无候选数上限），故不需要 ANN/两阶段方案。
         """
+        # **⚠️ 这是近似检索（ANN），结果不保证精确**
+        #
+        # MariaDB 的 `VECTOR KEY` 是 HNSW —— 近似最近邻，recall 可以低于 100%，
+        # 而且它不会告诉你漏了什么。2026-10-25 在 memoria 的 documents_book_chunk
+        # （62.5 万点）上用自查询实测：
+        #
+        #     自查询 top-1 命中自己： 12/13 = 92%
+        #     自己在 top-10 里：      13/13 = 100%
+        #     （mhnsw_ef_search=20；调到 400 无任何变化，该参数在 12.3.2 上未见效）
+        #
+        # 排除过程：IGNORE INDEX 暴力扫描 → 精确正确；Python 手算余弦 → 0.000000；
+        # EXPLAIN → 确实走 idx_vec_chunk。所以数据与距离函数都对，是索引给了近似答案。
+        #
+        # 两条纪律：
+        #   1. 可以用它做语义召回（top-k 足够，实测 top-10 100%）——本函数正是此用途；
+        #   2. 绝不要用它做精确查找（自查询/判重/找重复/验证是否已入库），那会撞上那 8%。
+        #      精确查找走 FULLTEXT 或 LIKE。
+        #
+        # 表越小 recall 越高（图小、连通性好），但不要假设小表就是 100%。
+        # 另注：VEC_DISTANCE（不带 _COSINE）会报 index is not found；建索引时
+        # DISTANCE=cosine 必须显式写，否则静默降级为 mhnsw_default_distance（euclidean）。
+
         vec_text = "[" + ",".join(str(v) for v in query_vec) + "]"
         sql = (
             f"SELECT c.chunk_id, c.book_guid, c.chunk_seq, c.heading_path, "
@@ -608,11 +632,11 @@ class SearchEngine:
         tags: str | None,
         limit: int,
     ) -> list[dict[str, Any]]:
-        tokens = tokenize_query(query)
+        is_cjk = has_cjk(query)
+        tokens = build_cjk_boolean(query) if is_cjk else tokenize_query(query)
         if not tokens.strip():
             return []
 
-        is_cjk = has_cjk(query)
         col = "content_tokenized" if is_cjk else "content"
         table = tbl["table"]
 
@@ -651,6 +675,22 @@ class SearchEngine:
         tags: str | None,
         limit: int,
     ) -> list[dict[str, Any]]:
+        # **⚠️ 这是近似检索（ANN），结果不保证精确**
+        #
+        # MariaDB 的 VECTOR KEY 是 HNSW —— 近似最近邻，recall 可以低于 100%，
+        # 而且它不会告诉你漏了什么。2026-10-25 在 documents_book_chunk（62.5 万点）
+        # 上用自查询实测：top-1 命中自己 12/13 = 92%，自己在 top-10 里 13/13 = 100%。
+        # （mhnsw_ef_search=20；调到 400 无任何变化，该参数在 12.3.2 上未见效。）
+        #
+        # 排除过程：IGNORE INDEX 暴力扫描 → 精确正确；Python 手算余弦 → 0.000000；
+        # EXPLAIN → 确实走 idx_vec_chunk。所以数据与距离函数都对，是索引给了近似答案。
+        #
+        # 两条纪律：
+        #   1. 可以用它做语义召回（top-k 足够，实测 top-10 100%）——本函数正是此用途；
+        #   2. 绝不要用它做精确查找（自查询/判重/找重复/验证是否已入库），会撞上那 8%。
+        #      精确查找走 FULLTEXT 或 LIKE。
+        #
+        # 表越小 recall 越高（图小、连通性好），但不要假设小表就是 100%。
         table = tbl["table"]
 
         vec_text = "[" + ",".join(str(v) for v in query_vec) + "]"

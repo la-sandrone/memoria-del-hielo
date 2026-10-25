@@ -29,6 +29,11 @@
      三偏移四长度 + has_pua 输出；max_chars 可见码点硬护栏 + 码点×2≤8192 双保险）
      + build_book_card 书目卡片
    · mineru_postprocess.py — MinerU 输出后处理（脚注提取 + 图片路径重映射）
+   · mineru_schema.py — v3/v4 产物元数据的**唯一适配点**（四套 bbox 折 0–1、跨代块类型
+     别名、行内文本抽平、脚注候选集、图片类型映射、provenance、覆盖率审计）
+   · zip_input.py — MinerU `--format zip` 的**物化器**：解成普通目录（内容寻址，
+     <项目根>/cache/mineru_unzip/<zip 内容 md5>/），只解正文+两侧车+images/，
+     跳过 model_output.json；zip-slip 与总量上限**整包拒绝**（不清洗后继续）
    · search.py — v2 双路搜索：book 走 documents_book_chunk（chunk 级 + 书级聚合 +
      每书限流），has_pua 回查全文表；chat/onenote 整档粒度；CJK 向量0.8/全文0.2 不变。
      另含 find_books()：书级语义检索（书名+目录近邻，只排序不判存在性）；
@@ -43,7 +48,10 @@
    · book_importer.py — v2 chunk 层：二段事务状态机（一段记账 status='processing'
      + expected_chunks → 二段 chunk 分批入库 + 转 done 同事务原子）；幂等 = done 且
      chunks 数相符才跳过，processing/破损强制重导；embed_batch 批量嵌入，
-     目录模式只取 .md 避开 _origin.pdf，分类 tag = 扫描根目录名
+     目录模式取 SRC_EXTS（.md/.txt/MinerU zip）避开 _origin.pdf，分类 tag = 扫描根目录名；
+     zip 的**身份挂在 zip 上**（幂等键 + 书名），工作路径才是解包正文（identity_path）；
+     内联 base64 图**只落盘换引用、不 OCR**（_INLINE_IMAGE_OCR）；
+     裸结构 JSON（--format middle_json）明确拒绝并指路
    · chat_importer.py — 清洗 → 摘要 → 分词 → 嵌入 → 入库（⚠️ 整对话一个向量，
      超 8K token 会被 server_bge 静默截断——导入对话前需按轮次窗口改造）
    关键词: OneNote, 图书, AI对话, 幂等导入, 断点恢复, 8K截断
@@ -83,9 +91,15 @@
     · replay/smoke.replay — MCP 冒烟测试重放（11步）
     · replay/e2e.replay — MCP 端到端工作流（13步 + @save 变量传递）
     关键词: pytest, 重放
-14. docs/真实检索查询分布案例.md — <某创作项目>项目 190 条真实检索查询的分布台账
+14. docs/真实检索查询分布案例.md — 冰质星球项目 190 条真实检索查询的分布台账
     （主题簇 / 空结果归因 / 书级存在性判据标定 0.859 AUROC 但阈值误伤 27% / 召回回归基线）
     关键词: 真实查询, 召回回归, 存在性判据, 标定, negative rejection, Magnitude Mirage
+20. docs/为什么不要试图一个月搞懂Unicode以及我们给MinerU擦了多少屁股.md — **素材台账，未定稿**
+    （六类坑：Unicode 标准 / MinerU / DocVortex / 源 PDF / MariaDB / **我们自己**；
+      每条带「判据」与「归属」。发布前需过 tools/sanitize_scan.py 并复核归属一栏）
+    关键词: 裁判收错答题卡, 静默截断, 夹具自证, NFKC 稳定性, UCA 隐式权重,
+            parse_mode, bbox 四种口径, 标点折叠表, min_token_size, 未定稿
+
 
 ## 关键词速查表
 | 关键词 | 模块 |
@@ -103,6 +117,14 @@
 | 操作, 检查单, 常见问题 | 2 |
 | MCP Server, FastMCP | 11 |
 | MinerU, 脚注, page_footnotes | 7 (mineru_postprocess.py), 10 (CLI_USAGE.md §10) |
+| MinerU zip, --format zip, 解包, zip-slip | 7 (zip_input.py) |
+| middle_json, 裸结构 JSON, 拒绝导入 | 7 (zip_input.py + book_importer.py) |
+| 内联 base64, 内联图不 OCR, _INLINE_IMAGE_OCR | 7 (image_pipeline.py + book_importer.py) |
+| mineru_form, dir/full/flat, 溯源四列 | 7 (mineru_schema.py) + PROJECT_SPEC §4.7 |
+| SRC_EXTS, 可导入集合唯一真相源 | 7 (book_importer.py) + PROJECT_SPEC §13 |
+| mineru_batch, 批量调用 MinerU, 双适配 | 21 (mineru_batch.py) |
+| ENV_ACTIVATE_CMD, 环境激活命令, 自动判代 | 21 (mineru_batch.py) |
+| --format zip / --v4-format markdown | 21 (mineru_batch.py) + PROJECT_SPEC §4.7 |
 | chunk, 切块, 8K token 上限 | 3 ([chunking]), 7 (chunker.py) |
 | 幂等导入, 断点恢复, source_path_hash | 4, 8 (book_importer.py) |
 | 书级聚合, read_book_chunk, S2B | 7 (search.py), 11 |
@@ -115,6 +137,15 @@
 | 存在性判据, 召回回归, 真实查询, negative rejection, Magnitude Mirage | 14 (docs/真实检索查询分布案例.md), 7 (search.py 注释) |
 | 服务端, 测试, pytest | 13 |
 | 编码, 代码页, chcp, MSVCRT, PEP 528, PEP 540, -X utf8, isatty | 17 (OPERATIONS.md §17) |
+| 裁判收错答题卡 / 四条纪律 / 正对照 | 20 (docs/…屁股.md §1) |
+| 静默截断 / 静默跳过 / 静默空值 | 20 §1.1, §1.2 |
+| 夹具自证 / 夹具不许自己发明文件名 | 20 §1.3 |
+| NFKC 稳定性 / General_Category 不朽 / U+180E | 20 §2 |
+| UCA 隐式权重 / FB40E708 / DUCET 漂移 | 20 §2.7–2.10 |
+| parse_mode 不由 tier 决定 / bbox 四种口径 | 20 §3 |
+| 标点折叠表 / standard 折引号 / ﬅ→ft | 20 §4 |
+| min_token_size=3 / 2 字词必 0 / LIKE vs = | 20 §8 |
+| 康熙部首 / calibre Type 3 / 四种 bbox 坐标 | 20 §6 |
 
 ## 近似入口点
 - "想改数据库结构" → scripts/init_db.sql + PROJECT_SPEC.md §4 + docs/OPERATIONS.md §14（迁移记录）
@@ -131,9 +162,23 @@
 - "想调试 MCP Server" → tools/mcp_replay.py --replay tests/replay/smoke.replay
 - "想写新重放" → tests/replay/e2e.replay（带 @save 变量传递的参考）
 - "mhi-import-book 怎么用" → src/cli/mhi_import_book.py + docs/OPERATIONS.md §15.1
+- "MinerU 的 zip 怎么导入 / 解到哪去了" → src/core/zip_input.py（内容寻址 cache/mineru_unzip/）
+- "为什么 middle_json 不让导入" → src/importers/book_importer.py（refuse_explicit_mineru_json + _MINERU_JSON_HINT）+ PROJECT_SPEC §4.7
+- "批量的 PDF 怎么变成能导入的 md/zip / 用哪个工具" → mineru_batch.py（配套工具，独立于本库运行）
+- "mineru_batch 报『激活命令执行失败』/ 环境该怎么配" → mineru_batch.py 顶部 ENV_ACTIVATE_CMD 的注释块 + --mineru-version 显式跳过探测
+- "mineru_batch 输出的 zip 从哪来 / 为什么不是 md" → 同文件头部 v6.4 一节 + PROJECT_SPEC §4.7
+- "内联 base64 图为什么不做 OCR" → book_importer._INLINE_IMAGE_OCR 的注释 + docs/…屁股.md §十
+- "v4 该用哪个 --format / 为什么缺省变成 zip" → mineru_batch.py 头部 v6.4 一节 + PROJECT_SPEC §4.7
+- "为什么老书会被重新解析一遍" → mineru_batch.py 头部「skip 判据」一节（旧 flat .md 不满足 zip 判据）
+- "同目录既有 book.md 又有 book.zip，导哪一份" → src/importers/book_importer.py::_safe_glob_src（zip 优先，md 跳过并明说）
 - "MCP 工具有哪些" → src/mcp_server.py（7 个 @mcp.tool，只读检索+发现）
 - "测试怎么跑" → python -m pytest tests/（⚠️ 用装了依赖的解释器；系统 python3 缺 mariadb/regex 会直接 collect error）+ python tools/mcp_replay.py --replay tests/replay/smoke.replay
 - \"MinerU 脚注丢失/图片引用\" → src/core/mineru_postprocess.py + docs/CLI_USAGE.md §10
+- "PDF 读出来的字为什么是错的 / 我们承诺到哪一步" → README「闲话经验」§4 + 「免责」+ docs/…屁股.md §5
+- "知识库要不要处理 PDF / 文本可信度提示在哪" → README「闲话经验」§4 + src/mcp_server.py 三个工具的 docstring
+- "为什么不能全文 NFKC / Unicode 版本对不上怎么办" → 20 §1.2, §2（docs/…屁股.md）
+- "哪些坑是上游的、哪些是我们自己的" → 20 §七（**先看这节**）
+- "为什么向量路不在乎部首 / 为什么全文搜不到中文词" → 20 §8
 - "想改切块参数（大小/重叠/每书限流）" → config.toml [chunking] + src/core/chunker.py
 - "书搜不到具体内容 / 只返回整本书" → src/core/search.py _book_search（chunk 路径）
 - "导入中断了怎么办" → 重跑同一条导入命令（状态机幂等：done+chunks 相符才跳过）
@@ -171,3 +216,12 @@
       协议对齐 src/core/image_pipeline.py::_ocr_image
     · ⚠️ `enable_mkldnn=False` 是 paddle 3.3.x oneDNN PIR 回归 bug 的官方实测解法——别"顺手优化"打开
     关键词: OCR, PaddleOCR, 9008, 语言降级链, oneDNN, 常驻服务
+21. mineru_batch.py（仓库根）— **配套工具**：批量调用 MinerU 的外壳脚本（不 import 本库）
+    · v3/v4 双适配：自动判代（问**你配置的那个环境**里有没有 mineru-kit）、
+      按版本分流扩展名/长度预算/skip 判据；v4 缺省 `--format zip`
+    · **用前只改一处**：文件顶部的 `ENV_ACTIVATE_CMD`（激活 MinerU 环境的命令）。
+      自动判代与激活**共用同一条命令** ⟹ 不可能"说两套话"；跑不通就当场报错
+    · 产出交 `mhi import`：`.zip` 直接收（解到 cache/mineru_unzip/）；
+      `--format middle_json` 的产出不收（不是完整结果包）
+    · ⚠ 同时活在开发机另仓，两份须一致；发布以本仓为准
+    关键词: mineru_batch, MinerU, v3v4双适配, ENV_ACTIVATE_CMD, format zip, 配套工具

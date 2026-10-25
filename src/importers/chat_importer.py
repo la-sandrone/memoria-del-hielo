@@ -1,7 +1,7 @@
 """
 文件名: chat_importer.py
 摘要: AI 对话导入器。
-      输入 Chatbox 导出 .md，清洗 → 生成摘要 → jieba 分词 → 嵌入 → 入库。
+      输入 Chatbox 导出 .md，清洗 → 生成摘要 → unigram+bigram 分词 → 嵌入 → 入库。
 依赖: core.config, core.db, core.embedding, core.tokenizer, core.tags
       cleaners.chat_cleaner
 """
@@ -18,7 +18,7 @@ from ..core.config import get_config
 from ..core.db import get_db
 from ..core.embedding import get_embedding_service
 from ..core.tags import validate_write_tags
-from ..core.tokenizer import tokenize
+from ..core.tokenizer import tokenize_cjk_ub
 from ..cleaners.chat_cleaner import ChatCleaner
 
 
@@ -53,7 +53,7 @@ class ChatImporter:
         key_meta = manual_summary or self._cleaner.generate_summary(raw_text)
 
         # jieba 分词 → content_tokenized
-        text_tokenized = tokenize(cleaned_text)
+        text_tokenized = tokenize_cjk_ub(cleaned_text)
 
         # 嵌入（documents_chat.embedding 为 NOT NULL）
         embedding_vec = self._embedding.embed_one(cleaned_text)

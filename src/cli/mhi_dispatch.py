@@ -31,6 +31,8 @@ COMMANDS: tuple[tuple[str, str, str, tuple[str, ...]], ...] = (
     ("search", "mhi_search", "检索知识库（向量 + 全文混合）", ()),
     ("find-book", "mhi_find_book", "书级语义检索（找书：哪本书讲 X）", ("find",)),
     ("tag", "mhi_tag", "管理书/聊天的 tag", ()),
+    ("annotate", "mhi_annotate",
+     "按 manifest(jsonl/csv) 给已入库的书合并误差统计/注记", ("annotate-errata",)),
     ("rm", "mhi_remove_book", "删除已入库的书（路径 或 --guid）⚠️破坏性", ("remove",)),
     ("images", "mhi_cleanup_images", "清理引用计数为 0 的图片 ⚠️破坏性", ("cleanup-images",)),
     ("emb", "mhi_cleanup_emb_cache", "清理嵌入缓存（过期/全部/统计）⚠️破坏性", ("cleanup-emb-cache",)),

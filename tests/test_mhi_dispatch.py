@@ -108,7 +108,9 @@ def test_forwards_args_to_target_subcommand(capsys):
     """mhi import --help → 透传到 mhi_import_book 的 click help（不连库）。"""
     assert d.main(["import", "--help"]) == 0
     out = capsys.readouterr().out
-    assert "--bucket" in out and "--parallel" in out
+    assert "--bucket" in out
+    # 正对照：--parallel 已按用户裁定撤离（并行是日志归属歧义的根源）
+    assert "--parallel" not in out, "应已移除 --parallel 选项"
     assert "mhi import" in out  # prog_name 前缀正确
 
 

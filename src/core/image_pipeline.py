@@ -3,6 +3,9 @@
 摘要: 图片发现 → MD5 去重 → Everything 兜底 → OCR → 硬链接。
       从 Markdown 提取图片引用，计算 MD5，查 images 表复用或 OCR，
       硬链接到 images/{md5}（无扩展名），最后将 OCR 文本插回原文。
+      · 另含「内联 data URI 物化」：MinerU v4 的扁平 <stem>.md 把图片以
+        base64 内联（实测一本 21MB / 另一本 45MB），必须解码落盘 + 改写引用，
+        否则 base64 会整段进 chunk 与 documents_book.content。
 依赖: httpx
       Pillow (PIL), hashlib, re, shutil
       core.config, core.db
@@ -11,6 +14,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import logging
 import io
@@ -36,6 +40,12 @@ from .http_client import local_client
 _RE_MD_IMAGE = re.compile(r"!\[.*?\]\(([^\s\)]+)(?:\s+\"[^\"]*\")?\)")
 # HTML <img src="path">
 _RE_HTML_IMG = re.compile(r'<img[^>]+src\s*=\s*["\']([^"\']+)["\'][^>]*>', re.IGNORECASE)
+
+# 内联 data URI 图片（MinerU v4 扁平 md 的形态）
+# 实测：base64 字母表 A-Za-z0-9+/= 不含 ')'，且整条 data URI 通常独占一行
+_RE_DATA_URI = re.compile(
+    r"!\[(?P<alt>[^\]]*)\]\(data:image/(?P<mime>[a-zA-Z0-9.+-]+);base64,(?P<payload>[A-Za-z0-9+/=\s]+)\)"
+)
 
 _OCR_OK_EXTS = {".jpg", ".jpeg", ".png"}  # 可靠白名单；其他格式（GIF/BMP/WEBP/TIF）OCR前一律转PNG
 class ImagePipelineError(RuntimeError):
@@ -77,6 +87,7 @@ class ImagePipeline:
         progress: Callable[[int, int], None] | None = None,
         image_type_map: dict[str, str] | None = None,
         stop_check: Callable[[], bool] | None = None,
+        skip_ocr_all: bool = False,
     ) -> str:
         """从 Markdown 文本中处理所有图片引用。
 
@@ -94,6 +105,10 @@ class ImagePipeline:
             stop_check: 可选中断检查回调——逐张图前调用，返回 True 则
                 raise KeyboardInterrupt（并行导入第一次 Ctrl+C 时快速中止
                 当前书，不等剩余图片 OCR 完成）。
+            skip_ocr_all: 整本跳过图片 OCR（D1 裁定）。MinerU 的
+                `parse_mode == 'ocr'` 表示正文文字已由视觉模型产出，图片的
+                文字价值已被正文覆盖 ⟹ 不必再 OCR 一遍。为 None 语义的
+                `image_type_map` 兜底（v4 扁平 md 没有类型映射可用）。
 
         返回:
             OCR 文本已插入的更新版 Markdown。
@@ -124,7 +139,9 @@ class ImagePipeline:
             processed += 1
             # MinerU layout 判据：命中且类型 ∈ skip_types → 跳过 OCR（登记照做）
             img_type = image_type_map.get(raw_path) if image_type_map else None
-            skip_ocr = bool(img_type and img_type in self.skip_types)
+            skip_ocr = bool(skip_ocr_all) or bool(
+                img_type and img_type in self.skip_types
+            )
             try:
                 ocr_text = self._process_single_ref(
                     raw_path, source_dir, skip_ocr=skip_ocr
@@ -155,6 +172,102 @@ class ImagePipeline:
                     break
 
         return "\n".join(new_lines)
+
+    def materialize_inline_images(
+        self,
+        md_text: str,
+        *,
+        skip_ocr: bool = False,
+        progress: Callable[[int, int], None] | None = None,
+        stop_check: Callable[[], bool] | None = None,
+    ) -> tuple[str, int, int]:
+        """把 Markdown 里的内联 data URI 图片落盘进 KB 存储，并把引用改写成存储路径。
+
+        为什么必须做（MinerU v4 扁平 <stem>.md 的场景）：实测一本书 124 张 / 21MB、
+        另一本 185 张 / 45MB 的 base64 内联在正文里。原样放行的话这段 base64 会
+        整段进 chunk 与 documents_book.content —— 嵌入向量被噪声淹没、jieba 对
+        base64 空转。
+
+        与既有管线的接法（**关键，别改错**）：引用改写成**存储路径**
+        （`images/{md5}`，无扩展名，与 _hardlink_or_copy 的落点同一约定）。
+        随后 process_image_refs 会照常跑一遍：它的 _find_image 能解析这个绝对
+        路径，MD5 命中 images 表，直接复用已存好的 ocr_text 并插回正文。
+        ⟹ **OCR 只在物化阶段做一次**；ref_count 也只在 process_image_refs 里
+        自增一次（此处刻意不自增，否则同一张图会被计两次）。
+
+        参数:
+            md_text:    原始 Markdown。
+            skip_ocr:   True 时不调 OCR（MinerU v4 `parse_mode='ocr'` 场景：
+                        正文文字已由视觉模型产出，图片无文字价值）。
+            progress:   进度回调 (done+failed, total)。
+            stop_check: 中断检查；返回 True 则 raise KeyboardInterrupt。
+
+        返回:
+            (改写后的 Markdown, 成功物化张数, 失败张数)
+        """
+        matches = list(_RE_DATA_URI.finditer(md_text))
+        if not matches:
+            return md_text, 0, 0
+
+        do_ocr = bool(self.ocr_enabled) and not skip_ocr
+        if do_ocr and not self._ocr_available():
+            logger.warning(
+                "OCR 服务不可达（%s），内联图只落盘不 OCR（引用照常改写）",
+                self.ocr_endpoint,
+            )
+            do_ocr = False
+
+        db = get_db()
+        pieces: list[str] = []
+        cursor = 0
+        done = failed = 0
+        for m in matches:
+            if stop_check is not None and stop_check():
+                raise KeyboardInterrupt
+            alt = m.group("alt")
+            try:
+                # validate=True：宁可对畸形 base64 显式失败，也不要静默解出半个
+                # 图片（validate=False 会丢弃非字母表字符，属于静默降级）
+                data = base64.b64decode("".join(m.group("payload").split()), validate=True)
+            except ValueError as exc:
+                data = b""
+                logger.warning("内联图 base64 解码失败: %s", exc)
+
+            pieces.append(md_text[cursor:m.start()])
+            if not data:
+                # 解码失败的处置：**不保留原 data URI**（它本身就是污染源），
+                # 换成一个正文里看得见的失败标记 —— 显式，不静默降级
+                failed += 1
+                pieces.append(f"![{alt}](INLINE-IMAGE-DECODE-FAILED)")
+            else:
+                md5_hash = hashlib.md5(data).hexdigest()
+                dest = self.storage_dir / md5_hash
+                rows = db.execute_sql(
+                    "SELECT ocr_text FROM images WHERE md5_hash = ?", (md5_hash,)
+                )
+                if not rows:
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    if not dest.exists():
+                        dest.write_bytes(data)
+                    ocr_text = ""
+                    if do_ocr:
+                        try:
+                            ocr_text = self._ocr_image(dest) or ""
+                        except Exception as exc:  # noqa: BLE001 —— 单图失败不阻断整本
+                            logger.warning("内联图 OCR 失败 [%s]: %s", md5_hash[:12], exc)
+                    db.execute_sql(
+                        "INSERT INTO images (md5_hash, file_path, ocr_text) "
+                        "VALUES (?, ?, ?)",
+                        (md5_hash, str(dest), ocr_text),
+                    )
+                pieces.append(f"![{alt}]({dest})")
+                done += 1
+            cursor = m.end()
+            if progress:
+                progress(done + failed, len(matches))
+
+        pieces.append(md_text[cursor:])
+        return "".join(pieces), done, failed
 
     # ------------------------------------------------------------------
     # 内部处理
@@ -223,7 +336,7 @@ class ImagePipeline:
     ) -> Path | None:
         """按优先级查找图片文件。
 
-        0. Windows 绝对路径（E:\\...）→ 转 WSL 路径（/mnt/<drive>/...）
+        0. Windows 绝对路径（E:\\...）→ 转 WSL 路径（/mnt/e/...）
            （md 可能由非 MinerU 工具生成，图片引用为 Windows 路径）
         1. 直接路径（相对 source_dir 或绝对路径）
         2. Everything HTTP API 兜底

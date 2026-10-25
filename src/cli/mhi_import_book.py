@@ -4,10 +4,15 @@
       · 目录模式默认行为：根目录下存在一级子目录 → 每个子目录一次导入，
         tag = 子目录名（如 <corpus-root>\化学 → 每本书 tag 含"化学"）
       · --tags 本批手动 tag 与子目录 tag 叠加（"逻辑上把多个库串联为一个库"：
-        如 --tags <corpus-root> → 每本书 tags = "<corpus-root>,化学"，来源与学科双圈定）
+        如 --tags 解析素材3 → 每本书 tags = "解析素材3,化学"，来源与学科双圈定）
       · --no-dir-tag 禁止子目录自动 tag（整根目录一次导入，tag = 根目录名）
       · --exclude-dirs 排除名单（逗号分割，只作用于一级子目录分派；
         排除全部 → 自然回退单目录模式）
+      · 收 *.md / *.txt / **MinerU 的 *.zip**（归档内含 markdown.md 才算）；
+        zip 先物化到 cache 再按 md 导入，身份/书名挂在 zip 自己身上
+      · MinerU 的裸结构 JSON（--format middle_json 的产出）**明确拒绝**并指路
+        `--format zip`（官方：standalone structural JSON is not a complete
+        result package）
       · 胜利退出顺手清理过期嵌入缓存，并提示库内无任何 tag 的书——
         这是「漏打 tag」的显式探测器（见 core/tags.py / PROJECT_SPEC §4.6）
 依赖: click, importers.book_importer, core.db
@@ -19,6 +24,8 @@ import sys
 from pathlib import Path
 from ..core.db import get_db
 from ..importers.book_importer import (
+    SRC_EXTS,
+    MiddleJsonInputError,
     import_book_file,
     import_book_directory,
     reset_interrupts,
@@ -27,7 +34,7 @@ from ..importers.book_importer import (
 
 
 @click.command("mhi-import-book")
-@click.argument("path", type=click.Path(exists=True))
+@click.argument("paths", nargs=-1, required=True, type=click.Path(exists=True))
 @click.option("--bucket", default=None, help="目标桶（默认: 图书）")
 @click.option(
     "--tags", default="", help="本批手动 tag，英文逗号分割（与子目录 tag 叠加）"
@@ -46,46 +53,69 @@ from ..importers.book_importer import (
 @click.option(
     "--exclude-dirs", default="", help="排除的一级子目录名，英文逗号分割"
 )
-@click.option(
-    "--parallel",
-    type=int,
-    default=2,
-    help="并行导入的书数（默认 2；>2 有极大锁竞争风险；1 = 串行 + 阶段进度）",
-)
 def main(
-    path: str,
+    paths: tuple[str, ...],
     bucket: str | None,
     tags: str,
     recursive: bool,
     force: bool,
     no_dir_tag: bool,
     exclude_dirs: str,
-    parallel: int,
 ):
     """导入图书/游戏剧情文件到知识库（chunk 层，幂等可断点续传）。
+
+    PATH 可给**多个**（`mhi import A B C`）：它们视作**一组**，共用同一套参数
+    （--bucket/--tags/--recursive/--force 一并作用于全部）。书级计数器 `[X/N]`
+    的 N 是**全部 PATH 的可导入文件总数**（.md / .txt / MinerU 的 .zip），
+    X 跨 PATH 连续累加 —— 一次命令行 = 一次作业。
+    （每 PATH 各配一套参数的 ffmpeg 式语法见需求清单，尚未实施。）
 
     Ctrl+C 两级语义：第一次中断当前书（该书未入库，继续下一本）；
     第二次停止全部（已导书保留）。
     """
-    if parallel > 2:
-        click.echo(
-            click.style(
-                "警告: --parallel=%d > 2——chunk 表两个 FULLTEXT 索引并发插入互斥，"
-                "锁竞争极大（Lock wait timeout 风险），建议降到 2 或 1" % parallel,
-                fg="yellow",
-            ),
-            err=True,
-        )
-
     reset_interrupts()
     try:
-        p = Path(path)
-        if p.is_dir():
-            results = _import_dir(
-                p, bucket, tags, recursive, force, no_dir_tag, exclude_dirs, parallel
-            )
-        else:
-            results = [import_book_file(str(p), bucket, tags, force=force)]
+        ps = [Path(x) for x in paths]
+        excluded = {s.strip() for s in exclude_dirs.split(",") if s.strip()}
+
+        # ── 多 PATH = **一组**（用户裁定：追加无限个 PATH，但应用同样的参数设置）──
+        # 书级计数器 [X/N] 的 N 是**全部 PATH 的总数**，X 跨 PATH 连续累加
+        # （一次命令行 = 一次作业；已与用户确认，不按 PATH 分设）。
+        # 先枚举、后执行：`_count_path` 与 `_import_dir` **复用同一把尺**
+        # （_safe_glob_src），否则"计数的尺"与"执行的尺"迟早走偏。
+        totals = [_count_path(x, recursive, no_dir_tag, excluded) for x in ps]
+        grand_total = sum(totals)
+
+        results: list[dict] = []
+        seen = 0
+        for x, n in zip(ps, totals):
+            # 裸结构 JSON 是「这类输入不支持」，不是「这本坏了」：
+            # 报清楚、给改法，然后**继续处理其余 PATH**（不因一个坏 PATH 全停）
+            try:
+                if x.is_dir():
+                    results.extend(
+                        _import_dir(
+                            x, bucket, tags, recursive, force, no_dir_tag,
+                            exclude_dirs,
+                            index_offset=seen, grand_total=grand_total,
+                        )
+                    )
+                    seen += n
+                else:
+                    seen += 1
+                    # 单文件入口自身不打印书级行 ⟹ 这里补，保持序号连续
+                    click.echo(f"[{seen}/{grand_total}] {x.name}", err=True)
+                    results.append(
+                        import_book_file(str(x), bucket, tags, force=force)
+                    )
+            except MiddleJsonInputError as exc:
+                click.echo(
+                    f"\n❌ 拒绝导入：{exc}\n", err=True
+                )
+                results.append(
+                    {"file": str(x), "status": "error",
+                     "error": "MinerU 裸结构 JSON，不是完整结果包"}
+                )
         _print_results(results)
         # 胜利退出（无异常）→ 顺手清理过期嵌入缓存；异常/Ctrl+C 不清理
         from ..core.embedding import cleanup_expired_cache
@@ -126,7 +156,30 @@ def _warn_untagged() -> None:
         )
 
 
-def _import_dir(p: Path, bucket, tags, recursive, force, no_dir_tag, exclude_dirs, parallel: int = 3):
+def _count_path(p: Path, recursive: bool, no_dir_tag: bool, excluded: set) -> int:
+    """一个 PATH 会处理几个可导入文件（.md/.txt/MinerU zip）—— 供 [X/N] 求 N。
+
+    ⚠️ **必须与 `_import_dir` 的枚举严格同构**，且两边都复用 importer 的
+    `_safe_glob_src`。计数的尺与执行的尺一旦走偏，就会出现「总说 13、实际跑了 12」
+    —— 本项目踩过的平行宇宙型屎山，不能再造一个。
+    """
+    from ..importers.book_importer import _safe_glob_src
+
+    if p.is_file():
+        return 1
+    if not no_dir_tag:
+        subdirs = [d for d in p.iterdir() if d.is_dir() and d.name not in excluded]
+        if subdirs:
+            root_files = [
+                f for f in p.iterdir()
+                if f.is_file() and f.suffix.lower() in SRC_EXTS
+            ]
+            return sum(len(_safe_glob_src(d, True)) for d in subdirs) + len(root_files)
+    return len(_safe_glob_src(p, recursive))
+
+
+def _import_dir(p: Path, bucket, tags, recursive, force, no_dir_tag, exclude_dirs,
+                index_offset: int = 0, grand_total: int = 0):
     """目录导入：默认一级子目录分派（tag = 子目录名，与 --tags 叠加）。
 
     · 子目录分派模式：子目录内部一律 recursive=True（书名目录/auto 嵌套结构）
@@ -134,34 +187,53 @@ def _import_dir(p: Path, bucket, tags, recursive, force, no_dir_tag, exclude_dir
     · 单目录模式（无子目录 / --no-dir-tag）：tag = 根目录名（importer 内置
       category_tag = dir_path.name），manual_tags 叠加不变
     """
+    # 枚举用 importer 自己那把尺（_safe_glob_src），**不另写一套 glob** ——
+    # 否则"计数的尺"与"执行的尺"迟早走偏，出现"总说 13 实际跑了 12"。
+    from ..importers.book_importer import _safe_glob_src
+
     excluded = {s.strip() for s in exclude_dirs.split(",") if s.strip()}
     if not no_dir_tag:
         subdirs = sorted(
             d for d in p.iterdir() if d.is_dir() and d.name not in excluded
         )
         if subdirs:
-            results: list[dict] = []
-            for d in subdirs:
-                results.extend(
-                    import_book_directory(
-                        str(d), bucket, tags, recursive=True, force=force,
-                        parallel=parallel,
-                    )
-                )
-            # 根目录直属文件（散装 txt / pandoc 转出的 md）：tags=本批 tags
-            # —— LLM 从 source_path 自行推断细粒度语义，无需文件名启发式 tag
+            # ── 先枚举、后执行 ──
+            # 书级计数器显示 [X/总数]，而总数必须**跨全部子目录 + 根散装文件**一起算。
+            # 旧行为是每个 import_directory 各自计数 ⟹ 子目录分派下每组只有 1 本，
+            # 分母恒为 1（[1/1]），零信息量。
             root_files = sorted(
                 f
                 for f in p.iterdir()
-                if f.is_file() and f.suffix.lower() in (".md", ".txt")
+                if f.is_file() and f.suffix.lower() in SRC_EXTS
             )
+            counts = [len(_safe_glob_src(d, True)) for d in subdirs]
+            if not grand_total:          # 单 PATH 直调 ⟹ 自算（旧行为不变）
+                grand_total = sum(counts) + len(root_files)
+
+            results: list[dict] = []
+            seen = index_offset
+            for d, n in zip(subdirs, counts):
+                results.extend(
+                    import_book_directory(
+                        str(d), bucket, tags, recursive=True, force=force,
+                        index_offset=seen, grand_total=grand_total,
+                    )
+                )
+                seen += n
+            # 根目录直属文件（散装 txt / pandoc 转出的 md）：tags=本批 tags
+            # —— LLM 从 source_path 自行推断细粒度语义，无需文件名启发式 tag
             for f in root_files:
+                seen += 1
+                # 单文件入口自己不打印书级行 ⟹ 这里补，保持序号连续不断档
+                click.echo(f"[{seen}/{grand_total}] {f.name}", err=True)
                 results.append(
                     import_book_file(str(f), bucket, tags, force=force)
                 )
             return results
     return import_book_directory(
-        str(p), bucket, tags, recursive=recursive, force=force, parallel=parallel
+        str(p), bucket, tags, recursive=recursive, force=force,
+        index_offset=index_offset,
+        grand_total=grand_total or len(_safe_glob_src(p, recursive)),
     )
 
 

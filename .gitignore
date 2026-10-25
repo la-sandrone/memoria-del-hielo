@@ -38,3 +38,9 @@ Thumbs.db
 
 # pytest
 .pytest_cache/
+
+# 运行日志（本地运行产物：诊断快照 / 夜间任务日志，不提交）
+logs/
+
+# 探针草稿（一次性验证脚本，不进版本库）
+_scratch/

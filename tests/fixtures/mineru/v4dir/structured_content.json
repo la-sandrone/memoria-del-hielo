@@ -1,0 +1,223 @@
+{
+  "pages": [
+    {
+      "page_idx": 0,
+      "blocks": [
+        {
+          "type": "text",
+          "bbox": [
+            0.408,
+            0.033,
+            0.546,
+            0.06
+          ],
+          "content": "UNREAD"
+        },
+        {
+          "type": "image",
+          "bbox": [
+            0.0,
+            0.0,
+            0.548,
+            1.0
+          ],
+          "content": "",
+          "captions": [],
+          "footnotes": [],
+          "image_source": "images/page_0_image_1.jpg"
+        },
+        {
+          "type": "text",
+          "bbox": [
+            0.57,
+            0.035,
+            0.924,
+            0.135
+          ],
+          "content": "中国探月国家队记录人类首次登陆月球背面全过程"
+        },
+        {
+          "type": "text",
+          "bbox": [
+            0.59,
+            0.15,
+            0.904,
+            0.429
+          ],
+          "content": "月背征途"
+        },
+        {
+          "type": "text",
+          "bbox": [
+            0.585,
+            0.453,
+            0.914,
+            0.484
+          ],
+          "content": "北京航天飞行控制中心著"
+        },
+        {
+          "type": "text",
+          "bbox": [
+            0.606,
+            0.507,
+            0.889,
+            0.579
+          ],
+          "content": "全方位回顾中国探月历程月背软着陆与科学探索，揭示地外天体遥操作奥秘"
+        },
+        {
+          "type": "text",
+          "bbox": [
+            0.572,
+            0.666,
+            0.921,
+            0.741
+          ],
+          "content": "首次公开大量月背实拍高清图片"
+        },
+        {
+          "type": "text",
+          "bbox": [
+            0.642,
+            0.756,
+            0.869,
+            0.903
+          ],
+          "content": "中国科学院院士中国工程院院士孙家栋 叶培建吴伟仁 欧阳自远一致推荐"
+        },
+        {
+          "type": "text",
+          "bbox": [
+            0.649,
+            0.934,
+            0.861,
+            0.959
+          ],
+          "content": "图北方井日北上亡及社"
+        }
+      ]
+    },
+    {
+      "page_idx": 1,
+      "blocks": [
+        {
+          "type": "paragraph_title",
+          "bbox": [
+            0.122,
+            0.144,
+            0.266,
+            0.175
+          ],
+          "level": 2,
+          "content": "版权信息"
+        },
+        {
+          "type": "text",
+          "bbox": [
+            0.121,
+            0.215,
+            0.791,
+            0.239
+          ],
+          "content": "月背征途:中国探月国家队记录人类首次登陆月球背面全过程"
+        },
+        {
+          "type": "text",
+          "bbox": [
+            0.121,
+            0.257,
+            0.448,
+            0.281
+          ],
+          "content": "作者:北京航天飞行控制中心"
+        },
+        {
+          "type": "text",
+          "bbox": [
+            0.122,
+            0.298,
+            0.358,
+            0.322
+          ],
+          "content": "出品方:未读·探索家"
+        },
+        {
+          "type": "text",
+          "bbox": [
+            0.122,
+            0.34,
+            0.448,
+            0.364
+          ],
+          "content": "出版社:北京科学技术出版社"
+        }
+      ]
+    },
+    {
+      "page_idx": 2,
+      "blocks": [
+        {
+          "type": "text",
+          "bbox": [
+            0.204,
+            0.113,
+            0.798,
+            0.136
+          ],
+          "content": "©月面拍摄图片由国家航天局探月与航天工程中心授权"
+        }
+      ]
+    }
+  ],
+  "metadata": {
+    "file_suffix": "pdf",
+    "producer": {
+      "name": "mineru",
+      "version": "4.0.7"
+    },
+    "document": {
+      "title": "月背征途（嫦娥五号凯旋！中国探月工程官方记录人类首次登陆月球背面全过程！致敬中国航天！官方近百张高清月背照片首次公开） (未读·探索家)",
+      "authors": [
+        "北京航天飞行控制中心"
+      ],
+      "languages": [
+        "en"
+      ],
+      "publisher": "北京科学技术出版社",
+      "created_at": "2025-02-26T04:19:03+00:00",
+      "modified_at": "2025-02-25T21:19:03-07:00",
+      "creator_application": "calibre (4.18.0) [http://calibre-ebook.com]",
+      "producer_application": "calibre (4.18.0) [http://calibre-ebook.com]",
+      "page_count": 266,
+      "page_count_kind": "physical"
+    }
+  },
+  "extensions": {
+    "mineru": {
+      "tier": "flash",
+      "parse_mode": "ocr"
+    },
+    "docvortex_layout": {
+      "version": 1,
+      "pages": [
+        {
+          "page_idx": 0,
+          "width_pt": 612.0,
+          "height_pt": 792.0
+        },
+        {
+          "page_idx": 1,
+          "width_pt": 612.0,
+          "height_pt": 792.0
+        },
+        {
+          "page_idx": 2,
+          "width_pt": 612.0,
+          "height_pt": 792.0
+        }
+      ]
+    }
+  },
+  "is_full_document": false
+}

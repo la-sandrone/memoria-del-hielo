@@ -7,9 +7,15 @@
         同为 1 码点 / 1 可见 / UTF-8 3 字节 / 1 字素簇，故净化文本与原文在
         四个口径下逐字符等长 —— 偏移与长度对两者通用（chunk 存净化版，
         全文表存原文，回查零换算）。
+      · 康熙部首窄归一: U+2F00–U+2FDF → 对应 CJK 汉字（ICU 的 NFKC 单例
+        兼容分解，214 条，见 kangxi_table.py）。同四口径等长，故与 PUA 净化
+        共用同一套坐标不变式。动机: 老旧 EPUB/PDF 链路会把「月」写成
+        U+2F49「⽉」，渲染同一 glyph 但码点不同 —— 检索用「月球」匹配不到
+        「⽉球」。属**按显示等价还原码点**，不是猜语义。
       · 字素簇（UAX#29）: regex 模块 \\X 实现，切点完整性下界。
         将来换 PyICU 只改本文件的 grapheme_boundaries / align_floor / align_ceil。
 依赖: regex>=2024.5.15（ai-services venv；PyICU 备选，暂不引入）
+      ./kangxi_table（生成文件，纯字面量）
 """
 
 from __future__ import annotations
@@ -19,6 +25,8 @@ from array import array
 from bisect import bisect_left, bisect_right
 
 import regex
+
+from .kangxi_table import KANGXI_FOLD
 
 # ── PUA（私用区）──────────────────────────────────────────
 
@@ -49,6 +57,60 @@ def sanitize_pua(text: str) -> tuple[str, list[int]]:
         else:
             out.append(ch)
     return "".join(out), pos
+
+
+# ── 康熙部首窄归一 ────────────────────────────────────────
+# 表由 scripts/gen_kangxi_radical_table.py 从 ICU 生成（见 kangxi_table.py）。
+# 等长论证与 PUA 净化相同：源与目标都是 1 码点 / 1 可见 / UTF-8 3 字节 / 1 字素簇。
+
+
+def count_unicode_risk(text: str) -> tuple[int, int]:
+    """单遍统计文本里的两类**可观测** Unicode 风险，返回 (康熙部首数, PUA 数)。
+
+    只算「从 md/中间文件本身就能算出来」的信号 —— 本库不碰源 PDF，
+    所以不去猜"字体表有没有撒谎"，只如实数出可疑码点。用途是把风险
+    上卷成**书级标记**，供 MCP 工具在返回时告知 LLM。
+
+      · 康熙部首 U+2F00–U+2FDF：字体映射缺陷的显式表现
+        （「⽉背征途」这类：看着对，复制出来是另一个码点）
+      · 私用区 PUA：chunk 层已有 has_pua（决定回查取原文），此处上卷书级
+
+    为什么是计数而不是布尔：布尔丢掉量级。11,018 个（严重）与 3 个（偶发）
+    该给 LLM 不同的话。
+    """
+    kangxi = 0
+    pua = 0
+    for ch in text:
+        if is_kangxi_radical(ch):
+            kangxi += 1
+        elif is_pua(ch):
+            pua += 1
+    return kangxi, pua
+
+
+def is_kangxi_radical(ch: str) -> bool:
+    """该码点是否落在表内（即它有一个单码点 NFKC 汉字等价物）。"""
+    return ord(ch) in KANGXI_FOLD
+
+
+def fold_kangxi_radicals(text: str) -> str:
+    """康熙部首 → 对应 CJK 汉字的等长归一。
+
+    无部首时零拷贝返回原串（快路径）。等长保证：净化版与原文的码点索引、
+    可见码点偏移、UTF-8 字节偏移、字素簇边界**全部通用**——chunk 坐标对两者
+    一致，回查原文零换算。
+
+    不做全文 NFKC：NFKC 会额外折叠全角标点（实测月背征途一本就要动 3,571 个
+    「，」→「,」）并改变长度（+46），既破坏标点语义又让全部偏移失效。
+    """
+    if not any(ord(ch) in KANGXI_FOLD for ch in text):
+        return text
+    return "".join(KANGXI_FOLD.get(ord(ch), ch) for ch in text)
+
+
+def kangxi_positions(text: str) -> list[int]:
+    """文本中命中表内的码点位置（升序）。供审计/统计，不参与切块。"""
+    return [i for i, ch in enumerate(text) if ord(ch) in KANGXI_FOLD]
 
 
 # ── 可见码点 ──────────────────────────────────────────────

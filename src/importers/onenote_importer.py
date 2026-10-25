@@ -19,7 +19,7 @@ from ..core.config import get_config
 from ..core.db import get_db
 from ..core.image_pipeline import get_image_pipeline
 from ..core.tags import split_tags, validate_single_tag, validate_write_tags
-from ..core.tokenizer import tokenize
+from ..core.tokenizer import tokenize_cjk_ub
 
 # YAML front matter: ---\nkey: value\n...\n---\n
 _RE_YAML_FM = re.compile(
@@ -99,7 +99,7 @@ class OneNoteImporter:
         md_text = self._image_pipeline.process_image_refs(md_text, source_dir)
 
         # jieba 分词 → content_tokenized
-        text_tokenized = tokenize(md_text)
+        text_tokenized = tokenize_cjk_ub(md_text)
 
         guid = str(uuid.uuid4())
         db = get_db()

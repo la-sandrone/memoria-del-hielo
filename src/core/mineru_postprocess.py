@@ -1,12 +1,34 @@
 """
 文件名: mineru_postprocess.py
-摘要: MinerU 输出后处理——脚注提取 + 图片路径重映射。
-      检测 MD 同目录的 _middle.json 判定 MinerU 输出。
-      从 middle.json → discarded_blocks 提取脚注，
+摘要: MinerU 输出后处理——脚注提取（判据 v2）+ 图片路径重映射。
+      结构差异（v3/v4 三形态、四种 bbox 口径、跨代块类型名）**全部下沉到
+      core.mineru_schema**；本模块只负责「判据」与「落库」。
+      脚注判据 v2 = 类型优先（收 page_footnote/footnote、拒 footer/header/page_number、
+      其余回退底部区域），修掉 v1 的两头错（页脚冒充 24% / 误杀真脚注 13.6%）。
       图片映射四层策略：VLM 描述精确匹配 → images/ hash 直查
       → Everything 搜索裸 hash → 保留原样。
 依赖: json, re, pathlib, urllib.parse, requests
-      core.config, core.db
+      core.config, core.db, core.mineru_schema
+
+═══════════════════════════════════════════════════════════════════
+⚠️ 能力声明：我们只尽力，请留意上下文 —— PDF 大坑过多
+═══════════════════════════════════════════════════════════════════
+PDF 是一堆历史包袱的集合，而且**每一层都能撒谎**：
+  · 字体表可以撒谎：`CMap` 是**程序**不是表（规范把映射留给了生成它的程序），
+    所以"标准的 ToUnicode 解读"这东西根本不存在；
+  · ToUnicode 可写可不写；**写了也能是错的**；同一份文件不同阅读器结果可以不同；
+  · 生产者会用 ASCII 码位当字形槽来省空间（实测一本书 50 个这样的字体、
+    覆盖 27% 的页面），于是文本层给出的是**槽位号**，看着像正常拉丁字母；
+  · 渲染与提取是两条路：**渲染对而提取错**是常态，不是异常。
+**上游自己都不能解决 100%，我们也不假装能。**
+
+所以本模块的立场是「检测 → 计数上报 → 绕过去」，不是「修」：
+  1. 用**可验证的判据**把能判的判掉（判据要能配正对照、能证伪）；
+  2. 判不了 / 超出能力的，一律**显式计数上报**，绝不静默吞掉
+     （同 mineru_batch.py 的 DROP 政策：不修不猜，但必须上报，
+       否则结算不认账、跑几千本时你不知道少了几本）。
+**使用本模块的任何结论时请留意上下文**：数值只覆盖判据覆盖到的那部分；
+未覆盖的部分在统计里单列，**不要当成"没问题"**。
 """
 
 from __future__ import annotations
@@ -22,6 +44,12 @@ import requests
 
 from .config import get_config
 from .db import get_db
+from .mineru_schema import (
+    FOOTNOTE_TYPES,
+    NON_FOOTNOTE_TYPES,
+    MineruProduct,
+    load_product,
+)
 
 # ── 常量 ────────────────────────────────────────────────
 
@@ -40,8 +68,47 @@ _RE_DETAILS = re.compile(
 _RE_PAGE_NUMBER = re.compile(r'^[\s·]*\d+[\s·]*$')
 _RE_REF_NUMBER = re.compile(r'^\(\d+(?:,\s*\d+)*\)$')  # (178) (127, 203, 321)
 
-# 脚注高度阈值：y > 页面高度 × THRESHOLD 视为脚注区域
+# 脚注区域阈值。⚠️ 已折成 0–1 归一化坐标（mineru_schema 负责折算四套 bbox 口径），
+# 所以这个数**不再与页高相乘**。
 FOOTNOTE_Y_THRESHOLD = 0.70
+
+# 判据版本（落 page_footnotes.judge_version）。存量 64,256 条一律 'v1'，无需回填。
+JUDGE_VERSION_V1 = "v1"
+JUDGE_VERSION_V2 = "v2"
+JUDGE_VERSION = JUDGE_VERSION_V2
+
+
+def is_footnote_v2(block_type: str, y_top01: float | None) -> bool:
+    """脚注判据 v2 —— **类型优先**。
+
+    v1 的两头错（全库 64,256 条实测）：
+      · 不筛类型 ⟹ `footer`（页脚冒充）**15,367 条 = 24%**；
+      · 又叠加 `y >= 0.70` ⟹ **误杀真 `page_footnote` 80/588 = 13.6%**
+        （实测 y/h min 0.415、p10 0.629）。
+    ⟹ 类型判据已经够用，y 门槛在类型判据之上是**纯损失**。
+
+    v2 的规则：
+      · 类型 ∈ FOOTNOTE_TYPES（page_footnote / footnote）→ **收，不看 y**
+      · 类型 ∈ NON_FOOTNOTE_TYPES（footer / header / page_number）→ 拒
+      · 其余类型 → 回退底部区域判据（保住 v1 在无类型信息时的覆盖）
+    """
+    if block_type in FOOTNOTE_TYPES:
+        return True
+    if block_type in NON_FOOTNOTE_TYPES:
+        return False
+    return y_top01 is not None and y_top01 >= FOOTNOTE_Y_THRESHOLD
+
+
+def is_noise_text(text: str) -> bool:
+    """纯页码 / 文献编号 / 过短 —— 只用于**回退分支**。
+
+    类型明确的脚注不过这道闸：MinerU 说它是 `page_footnote` 就信它的类型判断，
+    不再拿字数去二次猜测（v1 用 `len(t) < 3` 属于同类的二次猜测）。
+    """
+    t = text.strip()
+    if len(t) < 3:
+        return True
+    return bool(_RE_PAGE_NUMBER.match(t) or _RE_REF_NUMBER.match(t))
 
 # 图片 hash 直查的扩展名尝试顺序
 _IMG_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.webp', '.bmp', '.gif')
@@ -61,73 +128,64 @@ class MineruPostprocessor:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def detect(md_path: Path) -> bool:
-        """检测是否为 MinerU 输出。
+    def load(md_path: Path) -> MineruProduct:
+        """装载产物元数据（provenance / 脚注候选 / 图片类型映射）。
 
-        判据：MD 同目录下存在 {stem}_middle.json。
+        判据全部在 core.mineru_schema（v3 目录 / v4 full / v4 flat 三形态）。
+        调用方一次装载、多处使用，避免重复读 json；`detect` 与它同源。
         """
-        middle = md_path.parent / f"{md_path.stem}_middle.json"
-        return middle.is_file()
+        return load_product(md_path)
+
+    @staticmethod
+    def detect(md_path: Path) -> bool:
+        """检测是否为 MinerU 输出（三形态统一判据，见 mineru_schema.load_product）。"""
+        return load_product(md_path).is_mineru
 
     def extract_footnotes(
         self,
         md_path: Path,
         book_guid: str,
     ) -> int:
-        """从 middle.json 提取脚注并入库 page_footnotes。
+        """提取脚注并入库 page_footnotes（判据 v2，写入 judge_version）。
 
         参数:
-            md_path:   Markdown 文件路径（用于定位 middle.json）。
+            md_path:   Markdown 文件路径。
             book_guid: documents_book 中已入库的 GUID。
 
         返回:
-            入库的脚注条数。
+            入库的脚注条数（**尝试数**，与 v1 同口径，便于对账）。
         """
-        middle_path = md_path.parent / f"{md_path.stem}_middle.json"
-        if not middle_path.is_file():
-            raise FileNotFoundError(f"middle.json not found: {middle_path}")
+        product = load_product(md_path)
+        if not product.is_mineru:
+            return 0
 
-        with open(middle_path, "r", encoding="utf-8") as f:
-            middle = json.load(f)
-
-        pdf_info = middle.get("pdf_info", [])
         inserted = 0
-
-        for page in pdf_info:
-            page_idx = page.get("page_idx", -1)
-            if page_idx < 0:
+        for blk in product.footnote_candidates:
+            text = (blk.text or "").strip()
+            if not text:
                 continue
+            if blk.type in FOOTNOTE_TYPES:
+                pass                                  # 类型明确：信它
+            elif blk.type in NON_FOOTNOTE_TYPES:
+                continue                              # 页眉/页脚/页码：明确拒
+            elif not is_footnote_v2(blk.type, blk.y_top01) or is_noise_text(text):
+                continue                              # 其余：回退底部区域判据
 
-            page_height = page.get("page_size", [0, 0])[1]
-            if page_height <= 0:
-                continue
-
-            discarded = page.get("discarded_blocks", [])
-            for block in discarded:
-                text = self._extract_block_text(block)
-                if not text or not text.strip():
-                    continue
-
-                # 过滤非脚注
-                if self._is_noise(text, block):
-                    continue
-
-                # 位置过滤：需在页面底部 30% 区域
-                bbox = block.get("bbox", [0, 0, 0, 0])
-                y = bbox[1] if len(bbox) >= 2 else 0
-                if y < page_height * FOOTNOTE_Y_THRESHOLD:
-                    continue
-
-                block_type = block.get("type", "text")
-                bbox_json = json.dumps(bbox)
-
-                self._db.execute_sql(
-                    """INSERT IGNORE INTO page_footnotes
-                       (book_guid, page_idx, footnote_text, footnote_type, bbox)
-                       VALUES (?, ?, ?, ?, ?)""",
-                    (book_guid, page_idx, text.strip(), block_type, bbox_json),
-                )
-                inserted += 1
+            self._db.execute_sql(
+                """INSERT IGNORE INTO page_footnotes
+                   (book_guid, page_idx, footnote_text, footnote_type, bbox,
+                    judge_version)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    book_guid,
+                    blk.page_idx,
+                    text,
+                    blk.type,
+                    None if blk.bbox01 is None else json.dumps(list(blk.bbox01)),
+                    JUDGE_VERSION,
+                ),
+            )
+            inserted += 1
 
         return inserted
 
@@ -194,47 +252,6 @@ class MineruPostprocessor:
             i += 1
 
         return "\n".join(result_lines)
-
-    # ------------------------------------------------------------------
-    # 内部方法：脚注
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _extract_block_text(block: dict[str, Any]) -> str:
-        """从 discarded_block 中提取文本。"""
-        lines = block.get("lines", [])
-        texts: list[str] = []
-        for line in lines:
-            for span in line.get("spans", []):
-                if span.get("type") == "text":
-                    texts.append(span.get("content", ""))
-                elif span.get("type") == "inline_equation":
-                    content = span.get("content", "")
-                    texts.append(f"${content}$")
-        return " ".join(texts)
-
-    @staticmethod
-    def _is_noise(text: str, block: dict[str, Any]) -> bool:
-        """判断是否应排除的噪音块。"""
-        t = text.strip()
-
-        # 页码
-        if block.get("type") == "page_number":
-            return True
-
-        # 纯数字 / 点包围数字
-        if _RE_PAGE_NUMBER.match(t):
-            return True
-
-        # 文献编号引用 (178) (127, 203, 321)
-        if _RE_REF_NUMBER.match(t):
-            return True
-
-        # 页眉/页脚空内容
-        if len(t) < 3:
-            return True
-
-        return False
 
     # ------------------------------------------------------------------
     # 内部方法：图片映射

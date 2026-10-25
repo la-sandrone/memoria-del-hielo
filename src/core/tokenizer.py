@@ -18,6 +18,16 @@ _CJK_RE = re.compile(
 # 标准空白分隔（英文/ASCII 文本的分词模式）
 _WHITESPACE_RE = re.compile(r"\s+")
 
+# ── CJK 全文检索口径（unigram + bigram）用的「纯汉字」范围 ──────────────
+# 与上面的 _CJK_RE 不同：那里含标点/全角符号（用于"这段文本算不算 CJK"），
+# 这里只取汉字——标点成 token 会污染索引。
+_CJK_HAN = r"\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff"
+# ★ 2026-10-25：非 CJK 分支原来只认 `[A-Za-z0-9_]+`，西里尔/希腊/带变音拉丁
+#   匹配不到 ⇒ 整段丢弃（古典学专著里的俄文成批空白）。改为两段 alternation，
+#   顺序即优先级：① CJK → unigram+bigram；② \w+ → 所有 Unicode 字母整词保留。
+_CJK_CHUNK_RE = re.compile(f"([{_CJK_HAN}]+)|(\\w+)", re.UNICODE)
+_CJK_HAN_RE = re.compile(f"[{_CJK_HAN}]")
+
 _jieba_available: bool | None = None
 
 
@@ -98,3 +108,65 @@ def tokenize_query(query: str) -> str:
             tokens.append(f"+{w}*")
 
     return " ".join(tokens)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# CJK 全文检索口径：unigram + bigram（2026-10-25 起，**不走 jieba**）
+# ══════════════════════════════════════════════════════════════════════════
+
+def tokenize_cjk_ub(text: str) -> str:
+    """把文本切成 CJK unigram + bigram 串（写入 FULLTEXT 索引用）。
+
+    规则：
+      · 连续汉字串 → **每个汉字**一个 token + **每对相邻汉字**一个 token
+        "绘图工具" → 绘 图 工 具 绘图 图工 工具
+      · 英文/数字/下划线串 → 原样一个 token
+      · 其余字符（标点等）→ 丢弃
+
+    为什么不用 jieba（上面的 tokenize()）：
+      依据 Lucene `CJKBigramFilter(outputUnigrams=true)` 与 Elasticsearch 内置
+      `cjk_bigram`；学术侧见 SIGIR'98《Comparing Representations in Chinese
+      Information Retrieval》。bigram 与词切分效果相当甚至更好，且**不依赖词典**。
+      jieba 会把专名/新词/代码标识符切错（实测：62 万 chunk 里搜「会话」，
+      jieba 口径 78 命中 vs 原文 111 条——差的 33 行是被切成「会 话」）。
+
+    为什么必须带 unigram：只 bigram 时搜「绘」找不到「绘图」（索引里没有 1 字符 token）。
+
+    ★ 前置条件：MariaDB 侧 `innodb_ft_min_token_size = 1`（已配）。
+      取默认值 3 时 1-2 字符 token 在索引阶段被静默丢弃。
+    """
+    if not text:
+        return ""
+
+    out: list[str] = []
+    for cjk, other in _CJK_CHUNK_RE.findall(text):
+        chunk = cjk or other
+        if cjk:
+            out.extend(chunk)                                          # unigram
+            out.extend(chunk[i:i + 2] for i in range(len(chunk) - 1))   # bigram
+        else:
+            out.append(chunk)
+    return " ".join(out)
+
+
+def build_cjk_boolean(query: str) -> str:
+    """把用户查询转成 MATCH...AGAINST 的 BOOLEAN 表达式（写入侧口径的镜像）。
+
+    · 单字 CJK → `+字`
+    · 多字 CJK → 全部 bigram 用 AND 串起来（"+绘图 +图工 +工具"）
+    · 英文/数字 → `+原词`
+
+    与 tokenize_cjk_ub 必须保持同一套切分规则，否则查询侧拼出的 token
+    在索引里根本不存在（症状：明明有却搜不到，且不报任何错）。
+    """
+    terms: list[str] = []
+    for cjk, other in _CJK_CHUNK_RE.findall(query or ""):
+        chunk = cjk or other
+        if cjk:
+            if len(chunk) == 1:
+                terms.append("+" + chunk)
+            else:
+                terms.extend("+" + chunk[i:i + 2] for i in range(len(chunk) - 1))
+        else:
+            terms.append("+" + chunk)
+    return " ".join(terms)

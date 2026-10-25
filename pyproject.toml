@@ -55,6 +55,9 @@ embed = [
 ocr = ["paddleocr>=3.7", "paddlepaddle>=3.0"]
 # 开发
 dev = ["pytest>=8", "pytest-asyncio>=0.24"]
+# 生成/校验 src/core/kangxi_table.py 用（**运行时不依赖**：表已冻结成字面量）。
+# tests/test_radical_fold.py 会重新问 ICU 并断言现表一致 —— 没装则跳过该测试
+icu = ["PyICU>=2.15"]
 
 [project.scripts]
 mhi-import-book = "src.cli.mhi_import_book:main"

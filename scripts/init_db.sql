@@ -33,6 +33,31 @@ CREATE TABLE IF NOT EXISTS documents_book (
         -- 二段事务状态机：processing（一段未完）/ done（两段都成）
     expected_chunks   INT UNSIGNED NOT NULL DEFAULT 0,
         -- 一段结束时的预期 chunk 数；status='done' 且实际数相符才跳过重导
+    mineru_version    VARCHAR(32) NOT NULL DEFAULT '',
+        -- MinerU 产出方版本（'3.4.0' / '4.0.7'）；非 MinerU 产物留空
+    mineru_tier       VARCHAR(16) NOT NULL DEFAULT '',
+        -- [仅 v4] flash|basic|standard|advanced；v3 无档位概念 → 留空
+    mineru_parse_mode VARCHAR(16) NOT NULL DEFAULT '',
+        -- [仅 v4] txt|ocr|unknown。决定图片是否 OCR。
+        -- unknown = 扁平 md 拿不到该字段（我们兜住的历史产出）→ 保守走 OCR
+    mineru_form       VARCHAR(16) NOT NULL DEFAULT '',
+        -- 产物形态 dir(v3 目录) / flat(v4 扁平 md) / full(v4 完整侧车集)
+    errata_stats      JSON NOT NULL DEFAULT '{}',
+        -- 书级文本误差统计（判据/词表唯一权威源：src/core/text_errata.py；迁移 007）
+        --   {}                        = 未计算（**与「算了是 0」不同**，别混）
+        --   {"criteria_version":"v1", 已计算。键名见 text_errata._COUNT_KEYS：
+        --    chars / words / script_mix / accented_latin / hyphen_break /
+        --    cjk_halluc / kangxi_radical / pua
+        --    not_applicable: ["cjk_halluc"]  判据不适用（中文书）≠ 0}
+        -- 为什么是一列 JSON 不是一列一种：误差种类**开放**，列会无穷无尽。
+        -- 键的释义与判据同源（SIGNAL_GLOSSARY），渲染时按实际触发的键贴出
+        -- （MCP read_book_chunk 的 text_errata），词表不落库所以不会漂移。
+        -- 外部（mhi annotate 的 manifest）可加键，但须自带 glossary 释义，
+        -- 否则只标「未登记信号」，**不静默透传**。
+        -- ⚠️ 这台 MariaDB 不支持 -> / ->> 与 JSON_VALUE(... RETURNING)；
+        --    取值一律 JSON_EXTRACT / JSON_VALUE / JSON_KEYS。
+        -- 历史：迁移 006 的 kangxi_radical_count / pua_count 两列已由迁移 008
+        -- 删除（值折进本列）—— 它们的「0 = 未计算或 无」歧义正是本列要消掉的。
     source_path       VARCHAR(1024) DEFAULT '',       -- 原始文件路径（展示用）
     bucket            VARCHAR(64) NOT NULL,
     tags              TEXT DEFAULT '',
@@ -176,6 +201,10 @@ CREATE TABLE IF NOT EXISTS page_footnotes (
     page_idx       INT UNSIGNED NOT NULL,
     footnote_text  MEDIUMTEXT NOT NULL,
     footnote_type  VARCHAR(32) DEFAULT '',
+    judge_version  VARCHAR(16) NOT NULL DEFAULT 'v1',
+        -- 提取判据版本：v1=只靠「底部 y≥0.70×页高」收（footer 冒充占 24%、
+        -- 真 page_footnote 误杀 13.6%）；v2=类型优先（收 page_footnote/footnote，
+        -- 拒 header/footer/page_number，其余仍走底部兜底）。存量一律 v1，不回填
     bbox           VARCHAR(255) DEFAULT '',
     created_at     DATETIME DEFAULT CURRENT_TIMESTAMP,
     INDEX idx_footnotes_book (book_guid),

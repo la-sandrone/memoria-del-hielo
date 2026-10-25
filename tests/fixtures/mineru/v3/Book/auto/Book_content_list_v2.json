@@ -1,0 +1,541 @@
+[
+ [
+  {
+   "type": "image",
+   "content": {
+    "image_source": {
+     "path": "images/f0ef4d2f52c310e9fa205292f12334d05a4872fd94b57975d672ae14743fba53.jpg"
+    },
+    "content": "",
+    "image_caption": [],
+    "image_footnote": []
+   },
+   "bbox": [
+    0,
+    0,
+    552,
+    303
+   ]
+  },
+  {
+   "type": "paragraph",
+   "content": {
+    "paragraph_content": [
+     {
+      "type": "text",
+      "content": "如今<创作专名>平稳的局面，得来并不容易。我没有亲身参与过魔神战争，但在我看来…"
+     }
+    ]
+   },
+   "bbox": [
+    569,
+    93,
+    860,
+    149
+   ]
+  },
+  {
+   "type": "paragraph",
+   "content": {
+    "paragraph_content": [
+     {
+      "type": "text",
+      "content": "那不过是在「法则」驱使下，毫无价值的损耗…"
+     }
+    ]
+   },
+   "bbox": [
+    569,
+    151,
+    862,
+    189
+   ]
+  },
+  {
+   "type": "paragraph",
+   "content": {
+    "paragraph_content": [
+     {
+      "type": "text",
+      "content": "——纳西妲"
+     }
+    ]
+   },
+   "bbox": [
+    766,
+    190,
+    865,
+    206
+   ]
+  },
+  {
+   "type": "title",
+   "content": {
+    "title_content": [
+     {
+      "type": "text",
+      "content": "第五幕「天理沉寂后的第一王座」"
+     }
+    ],
+    "level": 1
+   },
+   "bbox": [
+    115,
+    380,
+    658,
+    412
+   ]
+  },
+  {
+   "type": "title",
+   "content": {
+    "title_content": [
+     {
+      "type": "text",
+      "content": "（一）魔神秩序"
+     }
+    ],
+    "level": 2
+   },
+   "bbox": [
+    127,
+    505,
+    312,
+    529
+   ]
+  },
+  {
+   "type": "paragraph",
+   "content": {
+    "paragraph_content": [
+     {
+      "type": "text",
+      "content": "·魔神 "
+     },
+     {
+      "type": "equation_inline",
+      "content": "^{1}"
+     }
+    ]
+   },
+   "bbox": [
+    154,
+    581,
+    213,
+    599
+   ]
+  },
+  {
+   "type": "paragraph",
+   "content": {
+    "paragraph_content": [
+     {
+      "type": "text",
+      "content": "人们总是需要神的，因为人们渴望祈祷被倾听，也渴望有谁能替自己背起重担。"
+     }
+    ]
+   },
+   "bbox": [
+    152,
+    604,
+    855,
+    624
+   ]
+  },
+  {
+   "type": "paragraph",
+   "content": {
+    "paragraph_content": [
+     {
+      "type": "text",
+      "content": "人们失去天使之后，地上便由一群长得稀奇古怪的「魔神」照顾着。他们挥挥手，绝望的人群就追随着它们、聚集了起来；他们稍作许诺，听众便手舞足蹈、欢呼雀跃；他们只是显露一点点奇迹，追随者们就感恩戴德。"
+     }
+    ]
+   },
+   "bbox": [
+    110,
+    627,
+    882,
+    695
+   ]
+  },
+  {
+   "type": "paragraph",
+   "content": {
+    "paragraph_content": [
+     {
+      "type": "text",
+      "content": "「现在的人类真是没出生在好时代啊。」"
+     }
+    ]
+   },
+   "bbox": [
+    163,
+    700,
+    504,
+    718
+   ]
+  },
+  {
+   "type": "paragraph",
+   "content": {
+    "paragraph_content": [
+     {
+      "type": "text",
+      "content": "尼可远离人群，内心这么想着。自己昔日的姐姐们，看起来不是比如今奇形怪状的魔神们要神圣、美丽得多吗？虽然魔神当中确实也有几个长得很好看啦…"
+     }
+    ]
+   },
+   "bbox": [
+    112,
+    724,
+    884,
+    766
+   ]
+  },
+  {
+   "type": "paragraph",
+   "content": {
+    "paragraph_content": [
+     {
+      "type": "text",
+      "content": "(参见手册附赠年表《<创作专名>历史时间线》)"
+     }
+    ]
+   },
+   "bbox": [
+    164,
+    819,
+    544,
+    837
+   ]
+  },
+  {
+   "type": "page_footnote",
+   "content": {
+    "page_footnote_content": [
+     {
+      "type": "equation_inline",
+      "content": "^{1}"
+     },
+     {
+      "type": "text",
+      "content": "  尼可角色故事"
+     }
+    ]
+   },
+   "bbox": [
+    114,
+    900,
+    226,
+    916
+   ]
+  },
+  {
+   "type": "page_footer",
+   "content": {
+    "page_footer_content": [
+     {
+      "type": "text",
+      "content": "免费书籍·禁止售卖"
+     }
+    ]
+   },
+   "bbox": [
+    235,
+    936,
+    366,
+    951
+   ]
+  },
+  {
+   "type": "page_number",
+   "content": {
+    "page_number_content": [
+     {
+      "type": "text",
+      "content": "73"
+     }
+    ]
+   },
+   "bbox": [
+    487,
+    951,
+    510,
+    964
+   ]
+  },
+  {
+   "type": "page_footer",
+   "content": {
+    "page_footer_content": [
+     {
+      "type": "text",
+      "content": "Free Books · Not for Sale"
+     }
+    ]
+   },
+   "bbox": [
+    638,
+    936,
+    806,
+    951
+   ]
+  }
+ ],
+ [
+  {
+   "type": "image",
+   "content": {
+    "image_source": {
+     "path": "images/9d229b8e8eeed70cc138366d0352e2aa0c1a30e6dd4db6146c6b46f3545d72b4.jpg"
+    },
+    "content": "",
+    "image_caption": [],
+    "image_footnote": []
+   },
+   "bbox": [
+    0,
+    0,
+    598,
+    300
+   ]
+  },
+  {
+   "type": "paragraph",
+   "content": {
+    "paragraph_content": [
+     {
+      "type": "text",
+      "content": "「永护蒙德，永护蒙德青绿的平原、山岭与丘陵与森林，愿它永葆苍翠」"
+     }
+    ]
+   },
+   "bbox": [
+    638,
+    93,
+    858,
+    149
+   ]
+  },
+  {
+   "type": "paragraph",
+   "content": {
+    "paragraph_content": [
+     {
+      "type": "text",
+      "content": "「永护蒙德，不再受暴君般的风雪，风雪般的暴君所困，愿它永远自由」"
+     }
+    ]
+   },
+   "bbox": [
+    638,
+    152,
+    860,
+    208
+   ]
+  },
+  {
+   "type": "paragraph",
+   "content": {
+    "paragraph_content": [
+     {
+      "type": "text",
+      "content": "——宗室长剑"
+     }
+    ]
+   },
+   "bbox": [
+    751,
+    210,
+    865,
+    225
+   ]
+  },
+  {
+   "type": "title",
+   "content": {
+    "title_content": [
+     {
+      "type": "text",
+      "content": "第五幕·温迪时代"
+     }
+    ],
+    "level": 1
+   },
+   "bbox": [
+    115,
+    406,
+    416,
+    436
+   ]
+  },
+  {
+   "type": "title",
+   "content": {
+    "title_content": [
+     {
+      "type": "text",
+      "content": "（一）风神的誓言  "
+     },
+     {
+      "type": "equation_inline",
+      "content": "^{1}"
+     }
+    ],
+    "level": 2
+   },
+   "bbox": [
+    129,
+    530,
+    344,
+    552
+   ]
+  },
+  {
+   "type": "paragraph",
+   "content": {
+    "paragraph_content": [
+     {
+      "type": "text",
+      "content": "·温迪吹散冰雪，建立新蒙德"
+     }
+    ]
+   },
+   "bbox": [
+    154,
+    605,
+    410,
+    623
+   ]
+  },
+  {
+   "type": "paragraph",
+   "content": {
+    "paragraph_content": [
+     {
+      "type": "text",
+      "content": "旧的神座崩毁，新神诞生。风神巴巴托斯体会到了指尖流淌的力量。他用这力量所做的第一件事，便是以少年的模样重塑自身形体。——因为只有用人类的形体，才能弹好少年钟爱的竖琴。他拂动琴弦，用神风吹散冰雪，劈开山峦。让新的蒙德成为自由之地吧，成为无人称王的国度。假以时日，应该会是很好、很浪漫的城邦…"
+     }
+    ]
+   },
+   "bbox": [
+    112,
+    627,
+    596,
+    790
+   ]
+  },
+  {
+   "type": "paragraph",
+   "content": {
+    "paragraph_content": [
+     {
+      "type": "text",
+      "content": "（温迪认为：）「他也会希望生活在这样的地方吧。」如是，「新蒙德」之肇始。"
+     }
+    ]
+   },
+   "bbox": [
+    154,
+    795,
+    594,
+    838
+   ]
+  },
+  {
+   "type": "image",
+   "content": {
+    "image_source": {
+     "path": "images/c46515234b60ee5bb613e49a8182a8942dd5b89182120c945fb4e5f7783bda4e.jpg"
+    },
+    "content": "",
+    "image_caption": [
+     {
+      "type": "text",
+      "content": "图 5 巴巴托斯"
+     }
+    ],
+    "image_footnote": []
+   },
+   "bbox": [
+    606,
+    551,
+    882,
+    847
+   ]
+  },
+  {
+   "type": "page_footnote",
+   "content": {
+    "page_footnote_content": [
+     {
+      "type": "equation_inline",
+      "content": "^{1}"
+     },
+     {
+      "type": "text",
+      "content": "  天空系列武器"
+     }
+    ]
+   },
+   "bbox": [
+    114,
+    900,
+    226,
+    916
+   ]
+  },
+  {
+   "type": "page_footer",
+   "content": {
+    "page_footer_content": [
+     {
+      "type": "text",
+      "content": "免费书籍·禁止售卖"
+     }
+    ]
+   },
+   "bbox": [
+    236,
+    936,
+    366,
+    951
+   ]
+  },
+  {
+   "type": "page_number",
+   "content": {
+    "page_number_content": [
+     {
+      "type": "text",
+      "content": "97"
+     }
+    ]
+   },
+   "bbox": [
+    487,
+    951,
+    509,
+    965
+   ]
+  },
+  {
+   "type": "page_footer",
+   "content": {
+    "page_footer_content": [
+     {
+      "type": "text",
+      "content": "Free Books · Not for Sale"
+     }
+    ]
+   },
+   "bbox": [
+    638,
+    936,
+    806,
+    951
+   ]
+  }
+ ]
+]

@@ -18,8 +18,8 @@
 | 8 | **MCP 是两个包**：mcp + fastmcp | `python -c "import mcp, fastmcp"` | ☐ |
 | 9 | PyMuPDF（可选，导入 PDF；懒加载） | `python -c "import fitz"` | ☐ |
 | 10 | ebooklib（可选，导入 EPUB；懒加载） | `python -c "import ebooklib"` | ☐ |
-| 11 | server_bge.py 运行中 | `curl http://localhost:10885/health` → `{"status":"ok"}` | ☐ |
-| 12 | WSL 已挂载 `D:` 盘 | `ls /mnt/<drive>/` 能看到 Windows D 盘 | ☐ |
+| 11 | server_bge.py 运行中（双端口） | `curl http://127.0.0.1:9005/health` 与 `curl http://127.0.0.1:9006/health` → `{"status":"ok"}` | ☐ |
+| 12 | WSL 已挂载 `D:` 盘 | `ls /mnt/d/` 能看到 Windows D 盘 | ☐ |
 
 > 💡 核心依赖一次装齐：
 > `uv pip install mariadb httpx requests numpy Pillow jieba chardet regex click rich mcp fastmcp`
@@ -85,8 +85,14 @@ password = ""      # 留空则读 MHI_DB_PASSWORD 环境变量
 database = "memoria_del_hielo"
 
 [embedding]
-endpoint = "http://localhost:10885"
-model = "BAAI/bge-large-zh-v1.5"
+model = "remote:BAAI/bge-m3"
+dimension = 1024
+local_endpoint = "http://127.0.0.1:9005/v1/embeddings"
+remote_endpoint = "http://127.0.0.1:9006/v1/embeddings"
+rerank_local = "http://127.0.0.1:9005/v1/rerank"
+rerank_remote = "http://127.0.0.1:9006/v1/rerank"
+# 可在 model 字段中加 "local:" 或 "remote:" 前缀；rerank_model 仅写模型名
+rerank_model = "remote:BAAI/bge-reranker-v2-m3"
 
 [search]
 default_top_k = 10
@@ -267,7 +273,7 @@ mysql -e "SELECT guid, LEFT(content_tokenized, 100) FROM memoria_del_hielo.docum
 
 ---
 
-*维护者：AI 协作者 / <user>*
+*维护者：项目所有者 / AI 协作者*
 *文档版本：v1.0 / 2026-07-24*
 
 ---
@@ -454,6 +460,7 @@ jieba 计算；init_db.sql 同步。无 migrate 文件（ALTER 已直改）。
   会话级 > config 默认 > 不过滤）
 - `[ocr] lang_chain` / `lang_confidence` / `skip_image_types`
 - server_bge.py 顶部 `REMOTE_QUOTAS`：按模型 RPM/TPM（embed 与 rerank **独立令牌桶**，互不挤占）
+- server_bge.py 顶部 `REMOTE_ACQUIRE_TIMEOUT`：单笔排队等待上限（默认 120s，超时回 busy 503）
 - MariaDB `max_allowed_packet=64M`（my.ini `[mysqld]` 持久化）——巨书单行
   （content 全文 ~19MB）超 16MB 默认包限被服务端断连（104）
 
@@ -468,7 +475,28 @@ jieba 计算；init_db.sql 同步。无 migrate 文件（ALTER 已直改）。
     paddlex 直接拿它和阈值比较，抛 `TypeError: '>=' not supported between 'list' and 'float'`；
     补丁取 `max()`（任一行达标即保留该块）
 - **server_bge.py**（仓库根目录）：REMOTE_QUOTAS 按模型限流（双令牌桶）；
-  远端 429 退避重试（1s/2s/4s ×3）；串行 FIFO 转发；`GET /health`
+  远端 429 退避重试（1s/2s/4s ×3）；串行 FIFO 转发；`GET /health`（见下）
+  - `GET /health`：**恒返 200**，`status` 恒 `"ok"`——只表示"进程存活"。上游故障体现在
+    body 里、不体现在状态码上（本文件检查清单、`diagnose_import.py`、`reimport_ocr_night.py`
+    都按 200 判活）。字段：
+    - `ok`：综合位（上游不在 down/degraded/misconfigured 时为 true）
+    - `transport`：`http1_forced` / `http2` / `h2_available` / `trust_env`
+      —— 对外连接**强制 HTTP/1.1** 的运行时可核对回显（改动或升级后核这个）
+    - `config.api_key_usable`：凭据可用性。**凭据问题与上游故障分档上报**，
+      不会把"本地没配 key"栽赃成"上游连不上"
+    - `buckets`：每桶（embed / rerank 各一，互不挤占）`available`（桶瞬时余量，
+      **不是用量**）+ `requests_last_60s` / `tokens_last_60s`（**真实用量滑窗**）+
+      `busy_events` / `oversize_rejected` / `acquire_timeout_sec`
+    - `upstream`：`state`（unknown / healthy / degraded / down / misconfigured）、
+      主动探针 `probe`（`GET /v1/models`，**免 token**；带认证返 200 即同时证明
+      "可达 + 凭据有效"）、`last_error`（`kind` / `ms` / `status` / `message` 四项齐备，
+      单看一行即可定案——`ms` 指纹用于区分"连接层没走网"与"真走网"）
+  - **限流失败是显式且快速的**（对齐 `server_paddle.py` 的 busy 约定）：
+    - 排队超 `REMOTE_ACQUIRE_TIMEOUT`（默认 120s）→ **503**
+      `{"error":"busy, retry later","busy":true}`，客户端应跳过、下轮续跑
+    - 单笔 token 估算超 TPM（如重排 >625 篇 × 800 字符）→ **400**，detail 明示需拆成多笔
+    - 两者都**不阻塞其它请求**。旧实现为无界等待：一笔超限即可锁死整条远端队列，
+      且需重启进程才能恢复（2026-09-27 修复）
 
 ### 15.5 注意事项
 

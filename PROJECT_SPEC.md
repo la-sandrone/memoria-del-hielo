@@ -302,6 +302,129 @@ SELECT COUNT(*) FROM documents_book WHERE tags LIKE ',%' OR tags LIKE '%,' OR ta
 
 ---
 
+### 4.7 MinerU 溯源 / 风险列（2026-09-28 新增，迁移 005+006）
+
+⚠️ §4 上面那张 `CREATE TABLE` 是 **fresh-install 基线**；本节列出 2026-09-28 起新增的列，
+真正的权威定义在 `scripts/init_db.sql`（已同步）与 `scripts/migrate_00*.sql`（增量）。
+
+**为什么加"这段文字是怎么来的"**：本库正文来自 PDF 的 md 产出，而**文本层不保证等于原文**
+（详见 README「闲话经验」§4 与 `docs/为什么不要试图一个月搞懂Unicode以及我们给MinerU擦了多少屁股.md`）。
+不给每本书留下溯源，事后就无法回答"这段话能不能信"。
+
+`documents_book` 新增 6 列（全部 `NOT NULL DEFAULT`，存量无需回填）：
+（⚠️ 其中 `kangxi_radical_count` / `pua_count` 两列已被迁移 008 删除，
+改为 `errata_stats` 一列 JSON —— 见下面 §4.7.1）
+
+| 列 | 回答什么 | 取值 |
+|---|---|---|
+| `mineru_version` | 哪个版本产的 | `3.1.6` / `3.4.0` / `4.0.7` / `''` |
+| `mineru_tier` | 哪个档位 | `flash`/`basic`/`standard`/`advanced`；**v3 恒 `''`** |
+| `mineru_parse_mode` | **这段文字是"读"来的还是"看"来的** | `txt` 文本层 / `ocr` 视觉 / `unknown` 拿不到 / `''` v3 无此字段 |
+| `mineru_form` | 产物形态 | `dir`（v3 目录）/ `full`（v4 完整侧车）/ `flat`（v4 扁平 md） |
+| ~~`kangxi_radical_count`~~ | 已删（⇒ `errata_stats.kangxi_radical`） | 见 §4.7.1 |
+| ~~`pua_count`~~ | 已删（⇒ `errata_stats.pua`） | 见 §4.7.1 |
+
+#### 4.7.1 文本误差统计（迁移 007 + 008，2026-10-06）
+
+> **修订 006 的裁定**：006 把「书级 Unicode 风险」落成 `kangxi_radical_count` /
+> `pua_count` 两列。实测下来一列一种走不通 —— **误差的种类是开放的**（形近串写、
+> 行尾断词、回吐训练语料……），照这样加列无穷无尽。改为**一列 JSON**：
+> `documents_book.errata_stats JSON NOT NULL DEFAULT '{}'`，两列由 008 删除。
+
+| 列 | 回答什么 |
+|---|---|
+| `errata_stats` | 本书的文本误差统计（JSON）。`{}` = **未计算**；任何非空 dict = 已记录 |
+
+```jsonc
+{}                                    // 未计算（迁移 007 之前的存量书）
+{"criteria_version": "v1",
+ "chars": 1234567, "words": 134069,   // 分母（计数离开分母不可比）
+ "script_mix": 8706,                  // 形近字母串写：同一词内混了两种文字系统
+ "accented_latin": 29,                //   其中「重音写成拉丁预组合元音」的子计数
+ "hyphen_break": 2071,                // 行尾连字符未合并
+ "cjk_halluc": 0,                     // 成串汉字（疑似回吐训练语料）
+ "kangxi_radical": 0, "pua": 0,
+ "not_applicable": ["cjk_halluc"]}    // 判据不适用（中文书）—— **不是 0**
+```
+
+四条纪律（都是踩过坑才写下的）：
+
+1. **`{}` ≠ 「算了是 0」**。空对象是「未计算」的唯一标记；这一条顺带填掉了 006
+   那个「0 = 未计算 或 无，两者语义不同」的疣 —— JSON 天然分得开。
+2. **跳过 ≠ 0**。中文书不启用 `cjk_halluc`（不设闸门会全线误报），跳过的键进
+   `not_applicable`，不许写 0 冒充。闸门 = 全文字符 CJK 占比 > 5%。
+3. **词表与判据同源**。`SIGNAL_GLOSSARY` 就在 `text_errata.py` 的判据旁边，
+   **不落库**；渲染时按**实际触发的键**把释义贴进 payload（省 token 且不可能漂移）。
+   新增判据必须同时登记词表，否则渲染时只能标「未登记信号」——**不许静默透传
+   一个 LLM 看不懂的键**。
+4. **判据的输入口径 = 落库后的 `documents_book.content`**。导入时算的和事后回填
+   算的必须是同一个字符串，否则会长出两套口径。实测依据：`fold_kangxi_radicals`
+   不在导入路径上、`collapse_whitespace` 保留 `\n`，故 `kangxi`/`pua`/`hyphen_break`
+   都能从 `content` 逐位重算 —— 798 本存量回填对账**口径不符 0 本**。
+
+**LLM 告知**：`read_book_chunk` 返回体里三个字段 ——
+`text_provenance`（引擎/档位/读数方式）、`text_errata`（计数 + 触发键的释义）、
+`text_trust`（渲染成一句话，含「引用本书内容时另找资料旁证」的指令）。
+键的清单**不在 docstring 里穷举**（会漂移），由 `text_errata` 随 payload 自文档化。
+
+**外部注记入口**：`mhi annotate --from <manifest.jsonl|.csv>`（默认 dry-run）。
+机械那部分判据由导入器自动算，但「每本书不一样」的东西（离线扫描、人工翻看、
+LLM 判断）代码里写不出规则，走 manifest 合并进同一列。匹配键按 robustness 降序
+试 `content_md5` → `source_path` → `title`，路径两侧归一（盘符 ↔ `/mnt/`、
+反斜杠、重复斜杠、NFC）；**多本命中一律拒绝，绝不静默取第一条**。
+
+**引擎约束（MariaDB 12.3.2 实测，别照搬 MySQL）**：
+`->` / `->>` / `JSON_VALUE(... RETURNING)` **都不支持** —— 取值用
+`JSON_EXTRACT` / `JSON_VALUE` / `JSON_KEYS`（别名 `keys` 是保留字）。
+`JSON` 别名会自动附带 `CHECK (json_valid(...))`，非法 JSON 直接 ERROR 4025。
+`ADD COLUMN IF NOT EXISTS` 幂等，且**与 `AFTER`、`ALGORITHM=INSTANT` 可共存**
+（`innodb_instant_alter_column_allowed = add_drop_reorder`）—— 真表 ~571 MB
+加列删列都是元数据级操作。
+`JSON_MERGE_PATCH` 可用但**本库不用**：它是 RFC 7396 语义（`null` 是**删除**不是
+赋值），而「计数覆盖 / 注记累加」的按键策略写成显式 Python 更可审计
+（`text_errata.merge_errata`）。
+
+`page_footnotes` 新增 1 列：
+
+| 列 | 说明 |
+|---|---|
+| `judge_version` | 脚注判据版本。存量 64,256 条一律 `'v1'`；**新写入为 `'v2'`**。v1 = 无类型筛选 + `y>=0.70`（实测两头错：页脚冒充 24% / 误杀真脚注 13.6%）；v2 = **类型优先**。用列区分而非回填，是 D9 的裁定。 |
+
+**`''` 与 `'unknown'` 是两个不同的东西**（真跑验过）：
+`''` = 那个年代的产出**没有这个字段**（v3）；`'unknown'` = 字段存在但**拿不到**（v4 扁平 md）。
+消费方不要把它们混为一谈。
+
+**新增模块 `src/core/mineru_schema.py`**（v3/v4 结构差异的唯一适配点）：
+把**四种 bbox 口径**（v3 `_middle.json` 页内 pt / v3 `_content_list*.json` 0–1000 /
+v3 `_model.json` 0–1 / v4 三种 json 0–1）折成一套 0–1、跨代块类型别名、行内文本抽平、
+脚注候选集、图片类型映射、provenance 提取。**判据留在 `mineru_postprocess.py`，结构差异全在此。**
+
+**LLM 告知**：`src/mcp_server.py` 的三个返回正文/书目的工具（`search_docs` / `find_books` /
+`read_book_chunk`）docstring 里带一句文本可信度提示；`read_book_chunk` 另按书附 `text_trust`
+（由上面两个计数列生成）。
+
+**2026-09-29 追加：v4 改 zip 缺省 + 输入端三种形态的收口**
+
+上游 `mineru-kit parse --format` 只有三个取值（官方 `reference/output_files`）：
+`markdown`（缺省）/ `middle_json` / `zip`。三者在**输入端**的处置各不相同：
+
+| `--format` | 产出 | 本库的处置 |
+|---|---|---|
+| `zip` | `markdown.md` + `middle_json.json` + `structured_content.json` + `images/`（+`model_output.json`） | **接受**。`mineru_batch.py` v6.4 起 v4 的缺省就是它 —— 因为只有它带 tier / parse_mode / 页号 / 脚注结构 / 图片类型，而 `flat` 把这批元数据全丢了 |
+| `markdown` | 单个 `<stem>.md`，图片 **base64 内联**（实测 77 页论文：6.5 MB 里 6.38 MB 是 base64，正文只有 118 KB） | **接受**，但内联图只落盘换引用、**不 OCR**（见 `book_importer._INLINE_IMAGE_OCR`） |
+| `middle_json` | 只有那个 json，**没有 markdown 正文、没有图片文件** | **拒绝**。官方原话：PDF `ParseResult.to_dict()/to_json()` "still omit block image_base64, so standalone structural JSON is not a complete result package" ⟹ 它做不成切片语料 |
+
+- **zip 输入**：`src/core/zip_input.py` 负责物化（解到 `cache/mineru_unzip/<zip 内容 md5>/`），
+  之后走**同一条 md 导入路径**，下游零改动。只解正文 + 两个侧车 + `images/`，
+  跳过 `model_output.json`（实测 8.4 MB 且本项目从不消费）。zip-slip 与总量上限一律**整包拒绝**。
+- **身份 vs 工作路径**：zip 的**身份**（幂等键 `md5(source_path)` + 书名）挂在 `.zip` 自己身上，
+  工作路径才是解包正文。若两者混用，清一次 cache 就换了本书、且每本书都叫 `markdown`。
+- **`full` 形态**（`mineru_form='full'`）因此成为 v4 的常态；`flat` 退为显式选择
+  （`--v4-format markdown`）。两者都仍被接受 —— 存量 flat 书不需要重导也能继续检索。
+- **跳过判据**：v4 一侧按 `--format` 认（zip 只认 `<out>/<stem>.zip`）。旧的 flat `.md`
+  **不再满足** zip 的跳过判据，否则 zip 的元数据永远拿不到；代价是历史上按 flat 解析过的书
+  会被重新解析一遍，故脚本的计划行会把这些书明确列出来。
+
 ## 5. config.toml
 
 ```toml
@@ -357,6 +480,7 @@ memoria-del-hielo/
 ├── pyproject.toml               # Python 项目元数据
 ├── server_bge.py                # 常驻嵌入 & 重排代理（9005 本地优先 / 9006 远端优先）
 ├── server_paddle.py             # PaddleOCR HTTP 服务（9008）
+├── mineru_batch.py              # 配套工具：批量调用 MinerU（v3/v4 双适配；不 import 本库）
 │
 ├── src/
 │   ├── mcp_server.py            # MCP Server 入口（mcp-memoria.del.hielo）
@@ -418,6 +542,8 @@ memoria-del-hielo/
 | `core/embedding.py` | 调用 server_bge.py 获取嵌入向量，缓存层（`{text_hash: vector}` JSON Lines） | 断点续传：入库前先查缓存，命中跳过；重排走远程端口 |
 | `core/search.py` | 双路搜索：全文搜索（MATCH...AGAINST）+ 向量搜索（VEC_DISTANCE_COSINE），合并结果 | 全文搜索优先（快速筛选），向量精排；返回时附带 key_metadata |
 | `core/image_pipeline.py` | 从 Markdown 提取图片引用 → 按路径查找 → Everything 兜底 → MD5 → OCR → 硬链接 | 找到图后先查 `images` 表，命中则 `ref_count++` 并复用 OCR |
+| `core/mineru_schema.py` | v3/v4 产物元数据的唯一适配点（四套 bbox 折 0–1、跨代块类型别名、行内抽平、provenance） | 判据不在此，结构差异全在此 |
+| `core/zip_input.py` | MinerU `--format zip` 的物化器：解成普通目录交回 md 路径；zip-slip / 总量上限整包拒绝 | 目录名 = zip **内容** md5；跳过 `model_output.json` |
 | `importers/*` | 每类素材的入库逻辑 | 单文件 + 批量两套入口，共用核心管线 |
 | `cleaners/chat_cleaner.py` | AI 对话 Markdown → 清洗后的纯 Markdown + 摘要 | 见第 10 节 |
 
@@ -723,7 +849,23 @@ def extract_key_metadata(md_text: str) -> str:
 
 ### 输入
 
-单个 .md / .txt / .epub / .pdf 文件，或包含此类文件的目录。
+单个 .md / .txt / MinerU `.zip` 文件，或包含此类文件的目录（递归时还收 .epub / .pdf）。
+
+**可导入集合的唯一真相源** = `book_importer.SRC_EXTS = (".md", ".txt", ".zip")`。
+CLI 的计数（`_count_path`）与 importer 的枚举（`_safe_glob_src`）都 import 它 ——
+此前 `(".md", ".txt")` 在 4 处各写一份，加 `.zip` 时必然漏一处，
+而"计数的尺"与"执行的尺"一旦走偏就会出现「总说 13、实际跑了 12」。
+
+`.zip` 另有一层**内容判据**：归档里必须有 `markdown.md`（官方 `ParseResult.save()` 必写的正文成员）。
+判据放在**枚举里**而不是导入时，否则被拒的 zip 会算进总数 N 却永远导不进来。
+判据只看这一条，**不做启发式** —— `--format middle_json` 的产出（裸结构 JSON）
+无论结构多像都不能导入，`_refuse_if_only_mineru_json` / `refuse_explicit_mineru_json`
+会明确拒绝并指路 `--format zip`。
+
+**同主干撞车**：同一目录下 `<stem>.md` 与 `<stem>.zip` 并存时 **zip 优先**，md 跳过并明说。
+两者是**同一次解析的两种序列化**，不是两本书；zip 是超集（侧车元数据 + 独立图片文件）。
+若两个都导，幂等键 `md5(source_path)` 不同 ⟹ 库内两条几乎重复的记录，且 flat 那份还会被
+zip 的侧车认领成 `mineru_form='full'`，溯源标签失准。只对 `.md` 生效（`.txt` 不是 MinerU 产出）。
 
 ### key_metadata
 
