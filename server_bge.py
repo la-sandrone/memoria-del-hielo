@@ -125,9 +125,34 @@ REMOTE_PROBE_TIMEOUT = 10.0       # 单次探测超时；实测正常耗时 160�
 
 # 单笔请求等待限流放行的上限（秒）。对齐 server_paddle.py 的既有项目约定
 # （Lock.acquire(timeout=120) → busy 503 → 客户端跳过、下轮续跑）。
-# 为什么必须有上限：acquire 是**持 _serial 锁**等待的，无界等待 = 一笔卡死锁死整条
-# 远端队列（2026-09-27 实测复现：acquire(600000) 永久阻塞，后续请求全部被锁死）。
+# 必须有上限：等待本身已改为 Future 叫醒（不再持锁），但**无界等待仍不可取**——
+# 一笔永远等不到的请求会永久占着调用方的 HTTP 连接与协程。
 REMOTE_ACQUIRE_TIMEOUT = 120.0
+
+# ── 排队与自适应并发（2026-10-25 v2 新增）──────────────────────────────
+# 远端可同时**在途**的请求数上限（AIMD 的天花板）。
+#
+# 先把「一路去」的语义钉死（用户 2026-10-25 原话）：
+#   「我那边编的转发器的设计就是任尔几路来，我只一路去。**本来这个设计是为了
+#     强行满足 RPM 和 TPM 设计要求的**，如果你有信心整好 RPM 和 TPM 问题的话，
+#     你可以不用转发。」
+# 所以「一路去」是**拓扑**：所有访问远端的流量都从这一个出口走，这样才能拿到
+# 按 key 结算的**真实配额数据**。它**不是**「一次只准发一个包」——串行是当年
+# 没有令牌桶时的权宜之计；令牌桶（本类的 `_can_grant`）成型后，硬约束由它承担，
+# 并发数就只负责「令牌到账时有没有人在等着领」。
+#
+# 为什么默认 16：RPM 配额 2000/min = 33.3 笔/秒，实测单笔 0.12–0.16s，
+# 打满约需 5 并发；给长尾（单笔偶发拖到 1s）留余量后 16 仍从容。
+# 令牌桶管**速率**（硬约束，绝不能违反），AIMD 管**在途数**（软约束，撞墙就降）。
+#   1  = 完全串行（仅供对照/排障，生产别用——实测只用到 20% 配额）
+#   >1 = 真并行；AIMD 从这个天花板起步、撞 429/超时乘性降、连续成功加性增
+# 探测法依据（用户定调）：多线程下载器怎么试自己进程数——**先开到指定的最高，
+# 然后看被没被拒，被拒了就减少**。不是从 1 慢启动，是从天花板往回退。
+REMOTE_MAX_INFLIGHT = int(os.getenv("REMOTE_MAX_INFLIGHT", "16"))
+# 加性增的触发条件：连续成功多少笔才 +1（越大越保守）。
+REMOTE_AIMD_INCREASE_AFTER = int(os.getenv("REMOTE_AIMD_INCREASE_AFTER", "8"))
+# 乘性降的系数：撞 429 / 超时 → limit × 系数（下限 1）。
+REMOTE_AIMD_DECREASE = float(os.getenv("REMOTE_AIMD_DECREASE", "0.5"))
 
 # 上游判 down 的阈值：连续失败达到该次数即 down（1 ~ 阈值-1 为 degraded）。
 UPSTREAM_FAIL_THRESHOLD = 4
@@ -599,32 +624,126 @@ class RateLimiterOversize(ValueError):
         self.tpm = tpm
 
 
-class RateLimiter:
-    """远端 RPM/TPM 令牌桶（平滑补充）+ 按到达顺序串行转发（FIFO）。
+class _Waiter:
+    """排队中的一笔请求。`future` 被 `set_result` 即「被叫到号」。
 
-    容量 = 配额（满桶起步），补充速率 = 配额/60 每秒 —— 突发后平滑恢复，
-    不会像滑动窗口那样锁死整个 60s 窗口。
-    rpm/tpm = 0 表示不限流（串行锁仍生效：请求按到达顺序排队）。
-    配置: 环境变量 REMOTE_RPM / REMOTE_TPM（0=不限，默认 0）。
+    用 `__slots__` 而非 dataclass：这个对象每笔请求都要建一个，字段固定三枚，
+    省掉 `__dict__` 是白拿的（本项目见过 `vector<vector<T>>` 式的分配灾难，
+    但也不该在另一个方向上浪费——高频短命对象用 slots 是常识）。
     """
 
-    def __init__(self, rpm: int = 0, tpm: int = 0, window: float = 60.0) -> None:
+    __slots__ = ("future", "tokens", "seq")
+
+    def __init__(self, future: "asyncio.Future", tokens: int, seq: int) -> None:
+        self.future = future
+        self.tokens = tokens
+        self.seq = seq
+
+
+def _is_congestion(exc: BaseException) -> bool:
+    """这个异常算不算「上游拥塞」信号（AIMD 的乘性降触发器）。
+
+    **只看语义，不看频次**：
+      · 超时 / 429 / 5xx → 是拥塞（对端扛不住，或链路堵了）
+      · 4xx（400 参数错、401 凭据错、413 超窗）→ **不是**拥塞，是我们自己的问题，
+        降并发不会让它变好，只会白白降低吞吐。
+
+    这个区分很重要：v1 把所有非 2xx 一视同仁地记进 /health 的失败率，
+    结果是「凭据配错」看起来像「上游不行」。
+    """
+    if isinstance(exc, httpx.TimeoutException):
+        return True
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code in (429, 500, 502, 503, 504)
+    return False
+
+
+class RateLimiter:
+    """远端 RPM/TPM 令牌桶 + FIFO 叫号队列 + AIMD 自适应并发。
+
+    令牌桶：容量 = 配额（满桶起步），补充速率 = 配额/60 每秒——突发后平滑恢复，
+    不会像滑动窗口那样锁死整个 60s 窗口。rpm/tpm = 0 表示不限流。
+
+    ══ v2 相对 v1 的三处改动（v1 的 `while True: ... sleep(0.05)` 已删除）══
+
+    1. **等待用 Future，不用轮询。** 排队者挂一个 Future 在 deque 上，由 `_pump()`
+       在「容量出现」时 `set_result` 叫醒。v1 每 50ms 醒一次问「能走了吗」；
+       v2 是「能走了我叫你」。asyncio 里 Future 就是这个「事件对象」——
+       对应 NT 的 dispatcher object / `KeSetEvent`，而不是定时器盲查。
+
+    2. **叫号严格从队首。** `_pump()` 只看 `deque[0]`，它走不了就停，**不跳号**。
+       这就是「近似尽力 FIFO、不饥饿」（抄 IRP 队列的意图）。代价：队首那笔
+       超大请求会挡住后面——但它有 deadline 兜底，超时自己退出队列。
+
+    3. **持锁轮询没了，锁也就没了。** 所有状态变更（`_refill`/`_deduct`/`_pump`）
+       都是**同步**函数——asyncio 单线程模型下天然原子。v1 之所以需要 `_serial`，
+       正是因为它把「等待」放在了锁里；等待改由 Future 承担后，临界区缩到几个
+       即刻返回的同步语句，锁成为多余。
+
+    ══ AIMD（并发维度，与令牌桶正交）══
+      · 令牌桶管**速率**（RPM/TPM，配额硬约束，不能违反）。
+      · AIMD 管**同时在途数**（`_inflight` vs `_limit`）。起点 = `max_inflight`
+        （先开到最高），撞 429/超时乘性降（×系数，下限 1），连续成功加性增（+1）。
+        参照 TCP 拥塞控制（RFC 5681）与 Netflix concurrency-limits 的判据形态。
+      · `max_inflight=1` 时 AIMD 退化为恒等（就是原来的「只一路去」），行为与 v1 一致。
+
+    ══ 用法 ══
+        async with limiter.slot(tokens=预估字符数):
+            await 打远端
+      或手工配对：`await limiter.acquire(...)` … `finally: limiter.release()`。
+      **漏掉 release 会让并发槽永久泄漏**——所以推荐 `slot()`。
+    """
+
+    def __init__(
+        self,
+        rpm: int = 0,
+        tpm: int = 0,
+        window: float = 60.0,
+        *,
+        max_inflight: int = 1,
+        aimd_min: int = 1,
+        aimd_increase_after: int = 8,
+        aimd_decrease_factor: float = 0.5,
+    ) -> None:
         self.rpm = rpm
         self.tpm = tpm
         self.window = window
-        self._serial = asyncio.Lock()
+
+        # ── 令牌桶 ──
         self._req_tokens = float(rpm) if rpm > 0 else 0.0
         self._tok_tokens = float(tpm) if tpm > 0 else 0.0
         self._last_refill = time.monotonic()
-        # 累计计费（供 /health 汇报"本进程一共从桶里取了多少"）——只增不减。
+
+        # 累计计费（供 /health 汇报「本进程一共从桶里取了多少」）——只增不减。
         self._charged_requests = 0
         self._charged_tokens = 0
-        # 真实用量滑窗：每笔放行记录 (单调时刻, tokens)。桶的"瞬时亏空"在平滑补充下
-        # 毫秒级就补回（2000rpm → 33/s），**答不了"这一分钟用了多少"**；滑窗才是答案。
+        # 真实用量滑窗：每笔放行记录 (单调时刻, tokens)。桶的「瞬时亏空」在平滑补充下
+        # 毫秒级就补回（2000rpm → 33/s），**答不了「这一分钟用了多少」**；滑窗才是答案。
         self._history: deque[tuple[float, int]] = deque()
-        # 有界等待 / 超大单笔的计数（供 /health 暴露，便于判读"是不是在反复撞限流"）
+
+        # 计数（供 /health 判读「是不是在反复撞限流」）
         self._busy_events = 0
         self._oversize_rejected = 0
+        self._acquired = 0
+
+        # ── FIFO 叫号队列（取代 v1 的 _serial 锁）──
+        self._waiters: deque[_Waiter] = deque()
+        self._seq = 0
+        self._wake_handle: "asyncio.TimerHandle | None" = None
+
+        # ── AIMD 并发门 ──
+        self.max_inflight = max(1, int(max_inflight))
+        self._limit = self.max_inflight          # 起点 = 天花板（「先开到最高」）
+        self._aimd_min = max(1, min(int(aimd_min), self.max_inflight))
+        self._aimd_increase_after = max(1, int(aimd_increase_after))
+        self._aimd_decrease_factor = min(0.9, max(0.1, float(aimd_decrease_factor)))
+        self._inflight = 0
+        self._ok_streak = 0
+        self._congestion_events = 0
+        self._limit_history: deque[int] = deque(maxlen=64)
+        self._peak_inflight = 0
+
+    # ── 内部：令牌与容量（全部同步 → 无锁）────────────────────────────────
 
     def _refill(self) -> None:
         now = time.monotonic()
@@ -646,11 +765,137 @@ class RateLimiter:
         while hist and hist[0][0] < cutoff:
             hist.popleft()
 
-    async def acquire(self, tokens: int = 0, timeout: float | None = None) -> None:
-        """按到达顺序等待放行。**两种失败都是有界的**（原实现是无界循环 → 持锁死锁）。
+    def _can_grant(self, tokens: int) -> bool:
+        """三个条件全满足才放行：并发槽有余 + RPM 够 1 笔 + TPM 够这笔。"""
+        if self._inflight >= self._limit:
+            return False
+        if self.rpm > 0 and self._req_tokens < 1.0:
+            return False
+        if self.tpm > 0 and tokens > 0 and self._tok_tokens < tokens:
+            return False
+        return True
 
-        tokens  = 本次请求预估消耗 token 数（TPM 用）。
-        timeout = 等待上限（秒）；None 取 REMOTE_ACQUIRE_TIMEOUT。
+    def _deduct(self, tokens: int) -> None:
+        """扣配额 + 占一个并发槽 + 记账。放行与 release 必须配对。"""
+        if self.rpm > 0:
+            self._req_tokens -= 1.0
+        if self.tpm > 0 and tokens > 0:
+            self._tok_tokens -= tokens
+        self._charged_requests += 1
+        self._charged_tokens += max(0, tokens)
+        now = time.monotonic()
+        self._history.append((now, max(0, tokens)))
+        self._prune_history(now)
+        self._inflight += 1
+        self._acquired += 1
+        if self._inflight > self._peak_inflight:
+            self._peak_inflight = self._inflight
+
+    # ── 内部：叫号器 ──────────────────────────────────────────────────
+
+    def _pump(self) -> None:
+        """叫号器：从队首开始放行，放完一个再看下一个；队首走不了就停。
+
+        **严格 FIFO**：不跳过走不了的队首去找后面的——跳号就是饥饿的开始。
+        僵尸项（future 已完成 = 超时/被取消）直接摘掉，否则队首永久卡死。
+        """
+        self._refill()
+        while self._waiters:
+            w = self._waiters[0]
+            if w.future.done():
+                self._waiters.popleft()
+                continue
+            if not self._can_grant(w.tokens):
+                break
+            self._waiters.popleft()
+            self._deduct(w.tokens)
+            w.future.set_result(None)     # ← 叫醒（Dispatcher Object / KeSetEvent）
+        self._arm_timer()
+
+    def _arm_timer(self) -> None:
+        """算出「队首还差多久」并定时重叫一次。
+
+        这是 v1 `sleep(0.05)` 的正确替代：不是盲查，而是**解析求解下一次可能放行
+        的时刻**（令牌桶线性补充 → 可算）。没有等待者、或队首在等并发槽（那种情况
+        由 `release()` 事件驱动，算不出时刻）时，**不装定时器**——不留空转句柄。
+        """
+        if self._wake_handle is not None:
+            self._wake_handle.cancel()
+            self._wake_handle = None
+        if not self._waiters:
+            return
+        w = self._waiters[0]
+        if w.future.done():
+            return
+        delay = self._seconds_until(w.tokens)
+        if delay is None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:      # 无事件循环（理论上不该发生）：交给下一次 pump
+            return
+        self._wake_handle = loop.call_later(max(delay, 0.001), self._on_wake)
+
+    def _on_wake(self) -> None:
+        self._wake_handle = None
+        self._pump()
+
+    def _seconds_until(self, tokens: int) -> "float | None":
+        """队首这笔还差多少秒才可能被放行。None = 现在算不出（要等 release 事件）。"""
+        if self._inflight >= self._limit:
+            # 并发槽被占满：对端何时返回不可预知 → 由 release() 触发 _pump
+            return None
+        self._refill()
+        need = 0.0
+        if self.rpm > 0 and self._req_tokens < 1.0:
+            need = max(need, (1.0 - self._req_tokens) / (self.rpm / self.window))
+        if self.tpm > 0 and tokens > 0 and self._tok_tokens < tokens:
+            need = max(need, (tokens - self._tok_tokens) / (self.tpm / self.window))
+        return need
+
+    def _abandon(self, w: _Waiter) -> None:
+        """把排队者从队列摘掉（幂等）。已被放行的不摘——那笔已经扣过配额。"""
+        try:
+            self._waiters.remove(w)
+        except ValueError:
+            pass          # 已被 _pump 放行，或已摘过
+        self._pump()
+
+    def _busy_detail(self, tokens: int) -> str:
+        head = self._waiters[0].tokens if self._waiters else 0
+        return (
+            "rpm_available=%.1f tpm_available=%.1f need_tokens=%d "
+            "waiters=%d inflight=%d/%d"
+            % (
+                self._req_tokens,
+                self._tok_tokens,
+                tokens,
+                len(self._waiters),
+                self._inflight,
+                self._limit,
+            )
+        )
+
+    def retry_after_s(self) -> float:
+        """给 503 响应用的 `Retry-After` 建议值（秒）。
+
+        口径：队首还要等多久就建议客户端等多久，至少 1 秒（免得客户端立刻重试
+        打空气）。若此刻算不出（在等 release），给一个保守的 5 秒。
+        """
+        if not self._waiters:
+            return 1.0
+        head = self._waiters[0].tokens
+        delay = self._seconds_until(head)
+        if delay is None:
+            return 5.0
+        return max(1.0, float(delay))
+
+    # ── 对外：放行 / 释放 / 反馈 ────────────────────────────────────────
+
+    async def acquire(self, tokens: int = 0, timeout: float | None = None) -> None:
+        """排队等待放行。成功返回即**占用一个并发槽**，调用方必须 `release()`。
+
+        推荐用 `async with limiter.slot(tokens=...)`（自动配对 + 喂 AIMD 信号）。
 
           · RateLimiterOversize —— tokens > tpm：桶永远满足不了，**立即拒绝**（不排队）。
           · RateLimiterBusy     —— 等待超过 timeout：快速失败，由调用方降级重试。
@@ -662,32 +907,80 @@ class RateLimiter:
 
         limit_s = REMOTE_ACQUIRE_TIMEOUT if timeout is None else timeout
         t_start = time.monotonic()
-        deadline = t_start + limit_s
-        async with self._serial:
-            while True:
-                self._refill()
-                req_ok = self.rpm <= 0 or self._req_tokens >= 1.0
-                tok_ok = self.tpm <= 0 or tokens <= 0 or self._tok_tokens >= tokens
-                if req_ok and tok_ok:
-                    if self.rpm > 0:
-                        self._req_tokens -= 1.0
-                    if self.tpm > 0 and tokens > 0:
-                        self._tok_tokens -= tokens
-                    self._charged_requests += 1
-                    self._charged_tokens += max(0, tokens)
-                    now = time.monotonic()
-                    self._history.append((now, max(0, tokens)))
-                    self._prune_history(now)
-                    return
-                if time.monotonic() >= deadline:
-                    self._busy_events += 1
-                    raise RateLimiterBusy(
-                        time.monotonic() - t_start,
-                        limit_s,
-                        "rpm_available=%.1f tpm_available=%.1f need_tokens=%d"
-                        % (self._req_tokens, self._tok_tokens, tokens),
-                    )
-                await asyncio.sleep(0.05)
+
+        # 快路径：无人排队且容量足够 → 立即放行（零 Future、零定时器、零调度）
+        self._refill()
+        if not self._waiters and self._can_grant(tokens):
+            self._deduct(tokens)
+            return
+
+        # 慢路径：入队，等叫号
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+        self._seq += 1
+        w = _Waiter(fut, tokens, self._seq)
+        self._waiters.append(w)
+        self._pump()
+
+        try:
+            await asyncio.wait_for(fut, timeout=limit_s)
+        except asyncio.TimeoutError:
+            self._busy_events += 1
+            detail = self._busy_detail(tokens)
+            self._abandon(w)
+            raise RateLimiterBusy(time.monotonic() - t_start, limit_s, detail) from None
+        except asyncio.CancelledError:
+            # 调用方被取消（客户端断开 / 外层超时）：摘掉自己，**不留僵尸占队首**
+            self._abandon(w)
+            raise
+
+    def release(self) -> None:
+        """释放一个并发槽（与 acquire 配对）。防御性钳位：不会减到负数。"""
+        if self._inflight > 0:
+            self._inflight -= 1
+        self._pump()
+
+    def report_success(self) -> None:
+        """一笔远端请求成功 → AIMD 加性增（连续成功满阈值才 +1，且不超天花板）。"""
+        self._ok_streak += 1
+        if self._ok_streak >= self._aimd_increase_after and self._limit < self.max_inflight:
+            self._limit += 1
+            self._ok_streak = 0
+            self._limit_history.append(self._limit)
+            self._pump()          # 上限涨了 → 可能有排队者能走
+
+    def report_congestion(self) -> None:
+        """一笔远端请求撞 429/超时/5xx → AIMD 乘性降（下限 aimd_min）。"""
+        self._congestion_events += 1
+        self._ok_streak = 0
+        new_limit = int(self._limit * self._aimd_decrease_factor)
+        new_limit = max(self._aimd_min, new_limit)
+        if new_limit != self._limit:
+            self._limit = new_limit
+            self._limit_history.append(self._limit)
+
+    @asynccontextmanager
+    async def slot(self, tokens: int = 0, timeout: float | None = None):
+        """`async with limiter.slot(tokens=...)`：自动配对 release + 喂 AIMD 信号。
+
+        AIMD 判据只看**最终**结果（`_embed_remote` 内部的 429 退避重试成功不算拥塞）：
+          成功             → report_success（加性增）
+          429 / 超时 / 5xx → report_congestion（乘性降）
+          其他异常（4xx）  → 中性：语义错误不是拥塞，降并发不会让它变好
+
+        `release()` 放在 `finally`，**任何路径都不会泄漏并发槽**。
+        """
+        await self.acquire(tokens, timeout)
+        try:
+            yield
+        except (httpx.TimeoutException, httpx.HTTPStatusError) as exc:
+            if _is_congestion(exc):
+                self.report_congestion()
+            raise
+        else:
+            self.report_success()
+        finally:
+            self.release()
 
     def snapshot(self) -> dict:
         """
@@ -732,6 +1025,23 @@ class RateLimiter:
                 # 实测校准（2026-09-27，用上游 usage 字段）：嵌入侧逐例相等（1.00x）；
                 # 重排侧对较长文档高估（0.36–0.41x）→ 偏保守、提前限流，不会超配额。
                 "accounting": "char_estimate",
+            },
+            # ── 并发维度（v2 新增；与上面两个速率维度正交）──
+            "concurrency": {
+                "inflight": self._inflight,
+                "peak_inflight": self._peak_inflight,
+                "limit": self._limit,
+                "max_inflight": self.max_inflight,
+                "waiters": len(self._waiters),
+                "acquired_total": self._acquired,
+                "congestion_events": self._congestion_events,
+                "ok_streak": self._ok_streak,
+                "increase_after": self._aimd_increase_after,
+                "decrease_factor": self._aimd_decrease_factor,
+                "limit_history": list(self._limit_history),
+                "policy": "AIMD：起点=天花板，撞 429/超时乘性降，连续成功加性增",
+                # 读法：limit 长期等于 max_inflight 且 congestion_events 不涨 = 没撞过墙；
+                #       limit 反复掉到 aimd_min = 上游确实在拒，别再往上加。
             },
         }
 
@@ -1047,15 +1357,22 @@ def create_app(
     http_client = _build_outbound_client()
 
     mode_label = "本地优先" if local_first else "远端优先"
-    # 远端 RPM/TPM 限流（配额见顶部 REMOTE_QUOTAS，按模型分开）：
-    # 所有远端请求按到达顺序串行转发（FIFO），并受令牌桶约束。
+    # 远端限流：令牌桶（RPM/TPM，配额硬约束）+ FIFO 叫号队列 + AIMD 自适应并发。
+    # max_inflight=1（默认）= 只一路去，行为与 v1 一致；调大才真并行。
+    # 两个桶**各自独立**：嵌入与重排是两条不同的配额，混在一起会互相误伤。
     limiter_embed = RateLimiter(
         rpm=REMOTE_QUOTAS[BUCKET_EMBED]["rpm"],
         tpm=REMOTE_QUOTAS[BUCKET_EMBED]["tpm"],
+        max_inflight=REMOTE_MAX_INFLIGHT,
+        aimd_increase_after=REMOTE_AIMD_INCREASE_AFTER,
+        aimd_decrease_factor=REMOTE_AIMD_DECREASE,
     )
     limiter_rerank = RateLimiter(
         rpm=REMOTE_QUOTAS[BUCKET_RERANK]["rpm"],
         tpm=REMOTE_QUOTAS[BUCKET_RERANK]["tpm"],
+        max_inflight=REMOTE_MAX_INFLIGHT,
+        aimd_increase_after=REMOTE_AIMD_INCREASE_AFTER,
+        aimd_decrease_factor=REMOTE_AIMD_DECREASE,
     )
 
     # 上游健康追踪：被动记录真实调用 + 主动周期探测（探针任务在 lifespan 里启动）
@@ -1145,45 +1462,51 @@ def create_app(
         model_name: str,
         texts: list[str],
     ) -> list[list[float]]:
-        """硅基流动远端嵌入（带上游健康取证）。"""
-        # 远端限流排队（按到达顺序；tokens = 字符数估算，中文 ~1 token/字）
-        await limiter_embed.acquire(sum(len(t) for t in texts))
+        """硅基流动远端嵌入（带上游健康取证）。
 
-        # 远端 429（配额抖动）：退避重试（1s/2s/4s，最多 3 次），仍失败才上抛
-        t0 = time.monotonic()
-        resp = None
-        try:
-            for attempt in range(3):
-                resp = await http_client.post(
+        限流/并发由 `limiter_embed.slot()` 承担：排队（FIFO 叫号）→ 放行 →
+        成功喂 AIMD 加性增 / 429·超时喂乘性降 / `finally` 释放并发槽。
+        tokens = 字符数估算（中文 ~1 token/字）。
+        """
+        async with limiter_embed.slot(tokens=sum(len(t) for t in texts)):
+            # 远端 429（配额抖动）：退避重试（1s/2s/4s，最多 3 次），仍失败才上抛。
+            # 注意：这里的重试**在并发槽内**——重试期间仍占着一个槽。凭据是第一性的
+            # （「只一路去」的设计），这点开销可接受；若将来开了高并发，可考虑把
+            # 退避等待挪到槽外。
+            t0 = time.monotonic()
+            resp = None
+            try:
+                for attempt in range(3):
+                    resp = await http_client.post(
+                        "/embeddings",
+                        json={
+                            "model": model_name,
+                            "input": texts,
+                            "encoding_format": "float",
+                        },
+                        headers={"Authorization": f"Bearer {remote_api_key}"},
+                    )
+                    if resp.status_code != 429 or attempt == 2:
+                        break
+                    await asyncio.sleep(2**attempt)
+                resp.raise_for_status()
+            except Exception as exc:
+                await tracker.record_failure(
+                    BUCKET_EMBED,
                     "/embeddings",
-                    json={
-                        "model": model_name,
-                        "input": texts,
-                        "encoding_format": "float",
-                    },
-                    headers={"Authorization": f"Bearer {remote_api_key}"},
+                    exc,
+                    status=getattr(resp, "status_code", None),
+                    ms=(time.monotonic() - t0) * 1000,
+                    message=_describe_upstream_error(exc, resp),
                 )
-                if resp.status_code != 429 or attempt == 2:
-                    break
-                await asyncio.sleep(2**attempt)
-            resp.raise_for_status()
-        except Exception as exc:
-            await tracker.record_failure(
-                BUCKET_EMBED,
-                "/embeddings",
-                exc,
-                status=getattr(resp, "status_code", None),
-                ms=(time.monotonic() - t0) * 1000,
-                message=_describe_upstream_error(exc, resp),
+                raise
+            await tracker.record_success(
+                BUCKET_EMBED, "/embeddings", (time.monotonic() - t0) * 1000
             )
-            raise
-        await tracker.record_success(
-            BUCKET_EMBED, "/embeddings", (time.monotonic() - t0) * 1000
-        )
-        data = resp.json()
-        # 按 index 排序
-        sorted_data = sorted(data["data"], key=lambda x: x["index"])
-        return [item["embedding"] for item in sorted_data]
+            data = resp.json()
+            # 按 index 排序
+            sorted_data = sorted(data["data"], key=lambda x: x["index"])
+            return [item["embedding"] for item in sorted_data]
 
     def _should_use_local(model_name: str) -> bool:
         """判断是否应该使用本地模型。"""
@@ -1401,13 +1724,18 @@ def create_app(
                 embeddings_list = await _embed_remote(remote_model, prepared)
         except RateLimiterBusy as exc:
             # 排队超时 → 503 busy（对齐 server_paddle.py 的项目约定：客户端跳过、下轮续跑）
+            # Retry-After 是 HTTP 层**唯一**的「叫醒」机制：HTTP 没有事件对象，
+            # 服务端无法主动告知客户端「轮到你」了，只能建议何时回来。
+            retry_after = limiter_embed.retry_after_s()
             return JSONResponse(
                 status_code=503,
+                headers={"Retry-After": str(int(round(retry_after)))},
                 content={
                     "error": "busy, retry later",
                     "busy": True,
                     "waited_sec": round(exc.waited_s, 1),
                     "acquire_timeout_sec": exc.limit,
+                    "retry_after_sec": round(retry_after, 1),
                     "detail": exc.detail,
                 },
             )
@@ -1505,51 +1833,58 @@ def create_app(
                         status_code=502,
                         detail="远端服务需要 SILICONFLOW_API_KEY，未配置",
                     )
-                await limiter_rerank.acquire(len(query) + sum(len(d) for d in documents))
-                # 远端 429（配额抖动）：退避重试（1s/2s/4s，最多 3 次）
-                t0 = time.monotonic()
-                resp = None
-                try:
-                    for attempt in range(3):
-                        resp = await http_client.post(
+                async with limiter_rerank.slot(
+                    tokens=len(query) + sum(len(d) for d in documents)
+                ):
+                    # 远端 429（配额抖动）：退避重试（1s/2s/4s，最多 3 次）
+                    t0 = time.monotonic()
+                    resp = None
+                    try:
+                        for attempt in range(3):
+                            resp = await http_client.post(
+                                "/rerank",
+                                json={
+                                    "model": remote_model,
+                                    "query": query,
+                                    "documents": documents,
+                                    "top_n": top_n,
+                                },
+                                headers={"Authorization": f"Bearer {remote_api_key}"},
+                            )
+                            if resp.status_code != 429 or attempt == 2:
+                                break
+                            await asyncio.sleep(2**attempt)
+                        resp.raise_for_status()
+                    except Exception as exc:
+                        await tracker.record_failure(
+                            BUCKET_RERANK,
                             "/rerank",
-                            json={
-                                "model": remote_model,
-                                "query": query,
-                                "documents": documents,
-                                "top_n": top_n,
-                            },
-                            headers={"Authorization": f"Bearer {remote_api_key}"},
+                            exc,
+                            status=getattr(resp, "status_code", None),
+                            ms=(time.monotonic() - t0) * 1000,
+                            message=_describe_upstream_error(exc, resp),
                         )
-                        if resp.status_code != 429 or attempt == 2:
-                            break
-                        await asyncio.sleep(2**attempt)
-                    resp.raise_for_status()
-                except Exception as exc:
-                    await tracker.record_failure(
-                        BUCKET_RERANK,
-                        "/rerank",
-                        exc,
-                        status=getattr(resp, "status_code", None),
-                        ms=(time.monotonic() - t0) * 1000,
-                        message=_describe_upstream_error(exc, resp),
+                        raise
+                    await tracker.record_success(
+                        BUCKET_RERANK, "/rerank", (time.monotonic() - t0) * 1000
                     )
-                    raise
-                await tracker.record_success(
-                    BUCKET_RERANK, "/rerank", (time.monotonic() - t0) * 1000
-                )
-                data = resp.json()
-                return data
+                    data = resp.json()
+                    return data
 
         except RateLimiterBusy as exc:
             # 排队超时 → 503 busy（对齐 server_paddle.py 的项目约定：客户端跳过、下轮续跑）
+            # Retry-After 是 HTTP 层**唯一**的「叫醒」机制：HTTP 没有事件对象，
+            # 服务端无法主动告知客户端「轮到你」了，只能建议何时回来。
+            retry_after = limiter_rerank.retry_after_s()
             return JSONResponse(
                 status_code=503,
+                headers={"Retry-After": str(int(round(retry_after)))},
                 content={
                     "error": "busy, retry later",
                     "busy": True,
                     "waited_sec": round(exc.waited_s, 1),
                     "acquire_timeout_sec": exc.limit,
+                    "retry_after_sec": round(retry_after, 1),
                     "detail": exc.detail,
                 },
             )

@@ -461,6 +461,13 @@ jieba 计算；init_db.sql 同步。无 migrate 文件（ALTER 已直改）。
 - `[ocr] lang_chain` / `lang_confidence` / `skip_image_types`
 - server_bge.py 顶部 `REMOTE_QUOTAS`：按模型 RPM/TPM（embed 与 rerank **独立令牌桶**，互不挤占）
 - server_bge.py 顶部 `REMOTE_ACQUIRE_TIMEOUT`：单笔排队等待上限（默认 120s，超时回 busy 503）
+- server_bge.py 顶部 `REMOTE_MAX_INFLIGHT`：远端**同时在途**请求数天花板（默认 `16`）。
+  AIMD 从它起步、撞 429/超时乘性降、连续成功加性增。
+  **「一路去」是拓扑不是速率**：所有远端流量汇聚到这一个出口（为了拿到按 key 结算的真实
+  配额数据），不是「一次只准发一个包」——串行是当年没有令牌桶时的权宜之计。
+  实测（2026-10-25）：并发 16 时 50 笔跑到 **32.0 笔/秒**，逼近 RPM 令牌桶上限 33.3 笔/秒，
+  `congestion_events=0`；设 1 时只有 6.7 笔/秒（≈402 RPM，**只用到 2000 RPM 配额的 20%**）
+- `REMOTE_AIMD_INCREASE_AFTER`（默认 8）/ `REMOTE_AIMD_DECREASE`（默认 0.5）：AIMD 步长
 - MariaDB `max_allowed_packet=64M`（my.ini `[mysqld]` 持久化）——巨书单行
   （content 全文 ~19MB）超 16MB 默认包限被服务端断连（104）
 
@@ -474,8 +481,15 @@ jieba 计算；init_db.sql 同步。无 migrate 文件（ALTER 已直改）。
     ——同属本地环境脚本，未随发布版提供。症状：多行文本块时 `rec_score` 是 `list[float]`，
     paddlex 直接拿它和阈值比较，抛 `TypeError: '>=' not supported between 'list' and 'float'`；
     补丁取 `max()`（任一行达标即保留该块）
-- **server_bge.py**（仓库根目录）：REMOTE_QUOTAS 按模型限流（双令牌桶）；
-  远端 429 退避重试（1s/2s/4s ×3）；串行 FIFO 转发；`GET /health`（见下）
+- **server_bge.py**（仓库根目录）：REMOTE_QUOTAS 按模型限流（双令牌桶）+
+  **FIFO 叫号队列**（严格不跳号）+ **AIMD 自适应并发**；
+  远端 429 退避重试（1s/2s/4s ×3）；`GET /health`（见下）
+  - 排队实现（2026-10-25 v2）：等待者挂 `Future`，容量出现时 `set_result` 叫醒。
+    旧实现是 `while True: … await asyncio.sleep(0.05)` **持锁轮询**——等待期间全局锁
+    不释放，且每 50ms 盲查一次。改成事件叫醒后，临界区全是同步语句，锁本身被删除。
+  - 定时唤醒是**解析求解**（令牌桶线性补充 → 可直接算出「还需多少秒」），
+    不是固定心跳。队首在等**并发槽**时算不出时刻 → 不装定时器，改由 `release()` 驱动
+  - 漏掉 `release()` 会永久泄漏并发槽 → 端点统一用 `async with limiter.slot(...)`
   - `GET /health`：**恒返 200**，`status` 恒 `"ok"`——只表示"进程存活"。上游故障体现在
     body 里、不体现在状态码上（本文件检查清单、`diagnose_import.py`、`reimport_ocr_night.py`
     都按 200 判活）。字段：
@@ -487,13 +501,20 @@ jieba 计算；init_db.sql 同步。无 migrate 文件（ALTER 已直改）。
     - `buckets`：每桶（embed / rerank 各一，互不挤占）`available`（桶瞬时余量，
       **不是用量**）+ `requests_last_60s` / `tokens_last_60s`（**真实用量滑窗**）+
       `busy_events` / `oversize_rejected` / `acquire_timeout_sec`
+      + `concurrency`（2026-10-25 新增）：`inflight` / `peak_inflight` / `limit` /
+      `max_inflight` / `waiters` / `acquired_total` / `congestion_events` /
+      `limit_history`。
+      **读法**：`limit` 长期等于 `max_inflight` 且 `congestion_events` 不涨 = 没撞过墙；
+      `limit` 反复掉到 1 = 上游确实在拒，别再往上加 `REMOTE_MAX_INFLIGHT`
     - `upstream`：`state`（unknown / healthy / degraded / down / misconfigured）、
       主动探针 `probe`（`GET /v1/models`，**免 token**；带认证返 200 即同时证明
       "可达 + 凭据有效"）、`last_error`（`kind` / `ms` / `status` / `message` 四项齐备，
       单看一行即可定案——`ms` 指纹用于区分"连接层没走网"与"真走网"）
   - **限流失败是显式且快速的**（对齐 `server_paddle.py` 的 busy 约定）：
     - 排队超 `REMOTE_ACQUIRE_TIMEOUT`（默认 120s）→ **503**
-      `{"error":"busy, retry later","busy":true}`，客户端应跳过、下轮续跑
+      `{"error":"busy, retry later","busy":true}` + **`Retry-After` 响应头**
+      （2026-10-25 新增：HTTP 没有事件对象，服务端无法主动通知「轮到你」，
+      只能建议客户端何时回来；body 里同时给 `retry_after_sec`）。客户端应跳过、下轮续跑
     - 单笔 token 估算超 TPM（如重排 >625 篇 × 800 字符）→ **400**，detail 明示需拆成多笔
     - 两者都**不阻塞其它请求**。旧实现为无界等待：一笔超限即可锁死整条远端队列，
       且需重启进程才能恢复（2026-09-27 修复）

@@ -7,6 +7,83 @@
 
 ---
 
+## 2026-10-25 — server_bge v2：事件叫醒排队 + AIMD 自适应并发
+
+### 动机
+
+v1 的 `RateLimiter.acquire` 是这样的：
+
+```python
+async with self._serial:          # 全局锁
+    while True:
+        self._refill()
+        if req_ok and tok_ok: … return
+        await asyncio.sleep(0.05)     # ← 持锁轮询
+```
+
+两个病，是同一件事的两面：
+
+1. **等待期间不释放锁**——`_serial` 被当成「闸门 + 睡眠室」，所有其他请求只能在锁上盲等。
+2. **每 50ms 醒一次盲查**——没有「资源可用」这个事件，只能定时自问。
+
+对照 NT 的 IRP 队列：IRP 的真实形态是「进队列 → `STATUS_PENDING` → 资源就绪时
+**`KeSetEvent`** → 完成」，**不是每 50ms 自己问一次能不能走**。v1 是后者。
+
+而 asyncio 的事件循环本身也不是「队列消费循环」——它是**派发表**（与 x86 的 IDT、
+NT 的 SSDT 同构：一张表 + 一个分发器 + 一个出让机制）。派发表上的正确等待原语是
+`Future`，不是 `sleep`。
+
+### 变更
+
+**`RateLimiter` 重写（`server_bge.py`）**
+
+| 维度 | v1 | v2 |
+|---|---|---|
+| 等待 | `while + sleep(0.05)` 轮询 | `await Future`，`_pump()` 里 `set_result` 叫醒 |
+| 公平 | `asyncio.Lock`（近似 FIFO） | 显式 `deque` 队列，**严格不跳号** |
+| 锁 | 必须有（等待在锁里） | **整个删掉**（临界区全是同步语句，单线程天然原子） |
+| 唤醒时机 | 固定 50ms 心跳 | **解析求解**「还需多少秒」后 `call_later`；算不出就不装定时器 |
+| 并发 | 恒为 1（串行闸门——当年没有令牌桶时的权宜之计） | AIMD，起点 = `REMOTE_MAX_INFLIGHT`（16），管在途数 |
+| 503 | 无建议 | `Retry-After` + `retry_after_sec` |
+
+**关键判断：队首在等「并发槽」时不装定时器。** 对端何时返回不可预知 → 时刻算不出来 →
+改由 `release()` 事件驱动。这是「事件对象」与「轮询」的本质区别：能算的算，不能算的等。
+
+**AIMD（新增，与令牌桶正交）**
+
+- 令牌桶管**速率**（RPM/TPM，配额硬约束，不能违反）
+- AIMD 管**同时在途数**（`_inflight` vs `_limit`）
+- 起点 = 天花板（「先开到指定的最高」），撞 429/超时 ×0.5（下限 1），连续成功 8 笔 +1
+- 判据只看**最终**结果：`_embed_remote` 内部的 429 退避重试成功**不算**拥塞
+- 4xx 语义错误（400/401/413）**不喂**拥塞信号——降并发不会让它变好
+- `REMOTE_MAX_INFLIGHT=1` 时 AIMD 退化为恒等（完全串行）；默认 **16**
+  ——「一路去」指**拓扑**（所有远端流量汇聚到一个出口拿真实配额数据），
+  不是「一次只准发一个包」。串行是当年没有令牌桶时的权宜之计（用户 2026-10-25 原话：
+  「本来这个设计是为了强行满足 RPM 和 TPM 设计要求的」），令牌桶成型后即放开。
+  **实测对比**：`1` → 6.7 笔/秒（402 RPM，只用到 20% 配额）；`16` → 32.0 笔/秒
+  （逼近令牌桶上限 33.3，`congestion_events=0`）
+
+**端点改造**：两处 `await limiter.acquire(...)` →
+`async with limiter.slot(tokens=...)`，`finally` 保证 `release()`，并发槽不会漏。
+
+### 测试
+
+`tests/test_rate_limiter.py`：21 例，**零依赖**（不 import pytest——本仓 serv-venv 全没装），
+既能 `python tests/test_rate_limiter.py` 直接跑，也能被 pytest 收集。覆盖：
+
+严格 FIFO 不跳号 / 超时离队 / 取消不留僵尸 / 并发槽不漏 / AIMD 升降与下限 /
+429 与 400 的判据分叉 / `_seconds_until` 的解析性 / 队列空不留定时器 / `/health` 口径。
+
+集成冒烟：`httpx.MockTransport` 假上游，验证 `slot()` 真被调用、200 后
+`acquired_total=1` 且 `inflight=0`、429 后 `congestion_events=1` 且 `max_inflight=4 → limit=2`。
+
+### 生效条件
+
+**运行中的进程是旧代码。** `~/ai-services/server_bge.py` 是指向本仓的 symlink，
+但已启动的 uvicorn 不会重载模块——**需重启 `server_bge` 两个端口上的进程**才生效。
+
+---
+
 ## 2026-10-25 — bigram 切换（影子表）、server_bge 超窗策略、多语言修正
 
 ### 动机
