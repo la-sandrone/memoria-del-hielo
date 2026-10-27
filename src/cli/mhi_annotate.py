@@ -21,7 +21,7 @@
 
       ── manifest 形状 ──────────────────────────────────────────
       JSONL（推荐，能表达嵌套）:
-        {"match": {"source_path": "/mnt/<drive>/解析素材5/解析后/.../某某.zip"},
+        {"match": {"source_path": "<corpus-root>/解析后/.../某某.zip"},
          "errata": {"script_mix": 233, "hyphen_break": 29},
          "glossary": {"my_metric": "这东西是什么，一句人话"},
          "note": "离线扫描：233 处串写、29 处断词",

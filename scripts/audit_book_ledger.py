@@ -17,7 +17,7 @@
 
 ■ 用法
     python scripts/audit_book_ledger.py                    # 只查库内（①–⑤）
-    python scripts/audit_book_ledger.py E:\\解析素材4\\论文  # 加第 ⑥ 层
+    python scripts/audit_book_ledger.py <local-path>  # 加第 ⑥ 层
 """
 from __future__ import annotations
 
@@ -152,7 +152,7 @@ def main() -> int:
         print("=" * 68)
         print("⑥ 已跳过 —— 未给语料根目录。**前五层只能证明「库里自洽」**，")
         print("   证明不了「该进的书都进了」。要查真账：")
-        print("       python scripts/audit_book_ledger.py E:\\解析素材4\\论文 [...]")
+        print("       python scripts/audit_book_ledger.py <local-path> [...]")
 
     c.close()
     return 0

@@ -203,7 +203,7 @@ MinerU 的外壳脚本**——它自己不做解析，只是把"一堆文档 + �
 bash 脚本去跑，然后盯着内存回收、断点续跑与失败结算。独立运行，不 import 本库任何东西。
 
 ```bash
-python mineru_batch.py -r "D:\论文" -o "D:\论文\_mineru_out" --tier standard
+python mineru_batch.py -r "<local-path>" -o "<local-path>" --tier standard
 python mineru_batch.py --dry-run -o "D:\out" a.pdf b.docx c.epub   # 只看生成的脚本
 ```
 

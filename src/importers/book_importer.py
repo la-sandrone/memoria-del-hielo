@@ -254,7 +254,7 @@ class BookImporter:
         # 身份路径：幂等键与书名都挂在**它**上面，不挂在 cache 路径上
         ident = identity_path if identity_path is not None else file_path
         source_path = str(ident.resolve())
-        # LLM 消费视角：存 Windows 风格路径（E:\...），检索结果直接可读
+        # LLM 消费视角：存 Windows 风格路径（<local-path>
         source_path = _to_windows_path(source_path)
         source_hash = hashlib.md5(source_path.encode("utf-8")).hexdigest()
         db = get_db()

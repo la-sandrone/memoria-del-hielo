@@ -123,7 +123,7 @@ def test_cli_guid_dry_run_lists_targets(monkeypatch):
         {
             "guid": "abc-123",
             "key_metadata": "《测试书》",
-            "source_path": "E:\\tmp\\测试书.md",
+            "source_path": "<local-path>",
             "chunks": 7,
         }
     ]
@@ -132,7 +132,7 @@ def test_cli_guid_dry_run_lists_targets(monkeypatch):
     assert res.exit_code == 0
     assert "abc-123" in res.output
     assert "《测试书》" in res.output
-    assert "E:\\tmp\\测试书.md" in res.output
+    assert "<local-path>" in res.output
     assert "未删除" in res.output
 
 
@@ -149,7 +149,7 @@ def test_cli_guid_partial_missing_requires_yes(monkeypatch):
         {
             "guid": "abc-123",
             "key_metadata": "《测试书》",
-            "source_path": "E:\\tmp\\测试书.md",
+            "source_path": "<local-path>",
             "chunks": 7,
         }
     ]

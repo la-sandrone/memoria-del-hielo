@@ -19,7 +19,7 @@ MinerU 批量处理脚本 v6.5 -- bash 生成器架构（MinerU v3 / v4 双适�
 
 用法:
   python mineru_batch.py [选项] 文件/目录 [文件/目录...]
-    -o D:\\解析素材2\\tmp           输出根目录（缺省=各书所在目录，各归其位）
+    -o <local-path>           输出根目录（缺省=各书所在目录，各归其位）
     --mineru-version auto         auto|3|4（缺省 auto：用 ENV_ACTIVATE_CMD 激活后问环境，
                                   有 mineru-kit 即 v4，优先 4；显式 3/4 可跳过探测）
     --venv ~/venv-mineru-v4       覆盖环境：激活命令改为 source "<X>/bin/activate"，
@@ -151,7 +151,7 @@ vllm / lmdeploy 两条后端都中招；lmdeploy 侧另有 KV cache block 逐页
 【-o 的目录语义（v4 特有的坑）】
 mineru-kit 用「末段有没有后缀」判 -o 是文件还是目录（kit/common.py 的
 is_output_path_file_like / resolve_single_output_path）。若 <out_root> **不存在**且末段
-带点（如 D:\解析素材4\论文.v2），它会被当成文件路径，于是单书模式把整篇 markdown 写进
+带点（如 <local-path> markdown 写进
 那个"文件"而不建目录。本脚本在每条 v4 命令前先 mkdir -p，把这个判断钉死成"目录"。
 
 【长度预算按版本算】
@@ -683,7 +683,7 @@ def win_name_ok(name):
 # 另：关于“用 8.3 短名绕过”这条经典通道——**本机实测它不可用，别拿它当方案**：
 #   * R:（9p 内存盘）：fsutil 报“整卷禁用 8dot3”，短名列空
 #   * F:（真 NTFS）：fsutil 报“已启用”，但
-#       for %I in (F:\书籍\历史\*) do @echo %~sI
+#       for %I in (<local-path>*) do @echo %~sI
 #     对现存每个书文件返回的短路径**与长路径完全相同、一个 ~N 标记都没有**
 #     -> 这些文件根本没有短名。很可能它们是 WSL/DrvFs 侧创建的，而那条创建路径
 #        不触发短名生成；也可能生成时该卷禁用、之后才启用。两种都未证实。

@@ -13,7 +13,7 @@ def test_zlib_layout_media_images(tmp_path: Path):
     img_dir.mkdir(parents=True)
     (img_dir / "00537.jpg").write_bytes(b"j")
 
-    raw = r"E:\某书\media\images\00537.jpg"
+    raw = r"<local-path>"
     assert _find_in_media_dirs(raw, tmp_path) == (img_dir / "00537.jpg").resolve()
 
 
