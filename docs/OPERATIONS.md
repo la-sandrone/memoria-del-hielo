@@ -19,7 +19,7 @@
 | 9 | PyMuPDF（可选，导入 PDF；懒加载） | `python -c "import fitz"` | ☐ |
 | 10 | ebooklib（可选，导入 EPUB；懒加载） | `python -c "import ebooklib"` | ☐ |
 | 11 | server_bge.py 运行中（双端口） | `curl http://127.0.0.1:9005/health` 与 `curl http://127.0.0.1:9006/health` → `{"status":"ok"}` | ☐ |
-| 12 | WSL 已挂载 `D:` 盘 | `ls /mnt/d/` 能看到 Windows D 盘 | ☐ |
+| 12 | WSL 已挂载 `D:` 盘 | `ls /mnt/<drive>/` 能看到 Windows D 盘 | ☐ |
 
 > 💡 核心依赖一次装齐：
 > `uv pip install mariadb httpx requests numpy Pillow jieba chardet regex click rich mcp fastmcp`
@@ -273,7 +273,7 @@ mysql -e "SELECT guid, LEFT(content_tokenized, 100) FROM memoria_del_hielo.docum
 
 ---
 
-*维护者：项目所有者 / AI 协作者*
+*维护者：AI 协作者 / <user>*
 *文档版本：v1.0 / 2026-07-24*
 
 ---
@@ -447,6 +447,17 @@ jieba 计算；init_db.sql 同步。无 migrate 文件（ALTER 已直改）。
 - **即弃连接**（db.py 重写）：无连接池。`execute_sql()` 每次新建连接用完即焚、
   `transaction()` 每事务一连接。连接池/信号量/烂连接/占满告警全部移除。
   max_allowed_packet 由服务端控制（mariadb 驱动握手自动跟随，无需客户端参数）
+- **攒批写入**（`core/sqlbatch.py`，2026-10-27 起）：`embedding_cache` 的逐条 upsert
+  改为攒批——N 行拼成一条多值 `INSERT ... ON DUPLICATE KEY UPDATE`，每次 flush 一条连接。
+  读侧同样批量化（`_cache_get_many`：300 个 hash 一条 `IN` 查询）。
+  **动机是端口**：3109 chunk 的书原先 6218 次连接（读 3109 + 写 3109），
+  Windows 动态端口被 TIME_WAIT 占满后客户端收到 `WSAEADDRINUSE 10048`，
+  表现为"跑到 608/3109 突然连不上"。攒批后降到 ~108 次（读 ~11 + 写 ~97）。
+- **包大小自适应**：攒批器首次 flush 前查 `@@session.max_allowed_packet`，
+  硬上限取 `min(配置值, 服务端值 × 0.75)`（**只压不涨**）；
+  运行中撞 `1153` 则上限砍半 + 二分重发（行数不丢），单行仍超才抛 `SqlBatchTooLarge`。
+  瞬时错误（10048/2002/2006/2013/1205/1213）指数退避重试，**1153 不盲重试**。
+  实测服务端 `max_allowed_packet=67108864`（64 MB），故默认 4 MB 上限有 ~16 倍余量。
 - **图片判据**：MinerU `_content_list_v2.json` → block type 为
   image/equation_interline 的图跳过 OCR（但仍 MD5 去重/登记），
   table/chart 必 OCR；非 MinerU 书无 json 全部正常

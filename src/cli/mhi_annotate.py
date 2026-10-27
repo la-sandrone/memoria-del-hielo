@@ -21,7 +21,7 @@
 
       ── manifest 形状 ──────────────────────────────────────────
       JSONL（推荐，能表达嵌套）:
-        {"match": {"source_path": "/mnt/e/解析素材5/解析后/.../某某.zip"},
+        {"match": {"source_path": "/mnt/<drive>/解析素材5/解析后/.../某某.zip"},
          "errata": {"script_mix": 233, "hyphen_break": 29},
          "glossary": {"my_metric": "这东西是什么，一句人话"},
          "note": "离线扫描：233 处串写、29 处断词",
@@ -29,7 +29,7 @@
 
       CSV（表格友好，嵌套字段请走 JSONL）:
         source_path,script_mix,hyphen_break,note,source
-        /mnt/e/...,233,29,离线扫描,audit_zip.py@2026-10-06
+        /mnt/<drive>/...,233,29,离线扫描,audit_zip.py@2026-10-06
 
       ⚠️ errata 里出现**既不在判据词表、又没自带 glossary 释义**的键会被拒绝
       （进 unregistered，渲染时只标「未登记信号」）—— 不许把一个 LLM 看不懂的

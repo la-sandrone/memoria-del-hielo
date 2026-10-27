@@ -336,7 +336,7 @@ class ImagePipeline:
     ) -> Path | None:
         """按优先级查找图片文件。
 
-        0. Windows 绝对路径（E:\\...）→ 转 WSL 路径（/mnt/e/...）
+        0. Windows 绝对路径（E:\\...）→ 转 WSL 路径（/mnt/<drive>/...）
            （md 可能由非 MinerU 工具生成，图片引用为 Windows 路径）
         1. 直接路径（相对 source_dir 或绝对路径）
         2. Everything HTTP API 兜底

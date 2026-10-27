@@ -502,6 +502,11 @@ MuPDF    …such as > (marsh) and : (machine)…      ← 完全一致
 > 文档依据：<https://manpages.debian.org/bookworm/mupdf-tools/mutool.1.en.html>、
 > <https://pymupdf.readthedocs.io/en/latest/app1.html>
 
+> **引用边界**：本文只引该系列的技术内容。同系列另一篇
+> （<https://mp.weixin.qq.com/s/w-Z3dPnp0qLFKrps6ZoJXQ>，Acrobat 的设定与关不掉的
+> 书签窗、`texdoc` 换 `viewer_pdf`）里含针对开发者群体的人身攻击与歧视性表述，
+> **不属于本文引用的范围**，公开版不收录。
+
 ### 5.5 把它跑成整本的数：这本书 27.1% 的页面上有「伪装成拉丁字母的槽位号」
 
 §5.3 只看了一页。用 `mutool extract`（抠出全部嵌入字体）＋ `fontTools`（读字体自己的表）

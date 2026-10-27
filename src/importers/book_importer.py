@@ -37,7 +37,7 @@ from typing import Any, Callable
 
 
 def _to_windows_path(p: str) -> str:
-    r"/mnt/d/xxx → D:\xxx（LLM 消费视角的 Windows 路径）；其余原样。"
+    r"/mnt/<drive>/xxx → D:\xxx（LLM 消费视角的 Windows 路径）；其余原样。"
     if p.startswith("/mnt/") and len(p) > 6 and p[6] == "/":
         return p[5].upper() + ":\\" + p[7:].replace("/", "\\")
     return p

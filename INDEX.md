@@ -20,6 +20,8 @@
    · db.py — MariaDB 即弃短连接（无状态：execute_sql 每次新建连接用完即焚、
      transaction 每事务一连接；连接池/信号量/烂连接问题从架构上消失，
      max_allowed_packet 由服务端控制）
+   · sqlbatch.py — 攒批装置：N 行一条多值 SQL、一条连接；双上限（行数 + 语句字节）、
+     探测服务端包限并按 75% 压顶、撞 1153 砍半拆批、瞬时错误退避重试
    · embedding.py — server_bge.py HTTP 客户端（嵌入 + 重排 + JSONL 缓存 + embed_batch 批量嵌入）
    · tokenizer.py — 共享分词工具（has_cjk + tokenize + tokenize_query）
    · unicode_utils.py — Unicode 数字面量工具（唯一权威实现）：可见码点口径、
@@ -91,7 +93,7 @@
     · replay/smoke.replay — MCP 冒烟测试重放（11步）
     · replay/e2e.replay — MCP 端到端工作流（13步 + @save 变量传递）
     关键词: pytest, 重放
-14. docs/真实检索查询分布案例.md — 冰质星球项目 190 条真实检索查询的分布台账
+14. docs/真实检索查询分布案例.md — <某创作项目>项目 190 条真实检索查询的分布台账
     （主题簇 / 空结果归因 / 书级存在性判据标定 0.859 AUROC 但阈值误伤 27% / 召回回归基线）
     关键词: 真实查询, 召回回归, 存在性判据, 标定, negative rejection, Magnitude Mirage
 20. docs/为什么不要试图一个月搞懂Unicode以及我们给MinerU擦了多少屁股.md — **素材台账，未定稿**

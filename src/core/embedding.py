@@ -4,7 +4,8 @@
       调用 server_bge.py (HTTP API) 获取 BGE-M3 1024维嵌入和重排分数。
       缓存表 embedding_cache 主键 (text_hash, model)，TTL 由
       [cache] ttl_days 控制（0 = 永不过期）。
-      铁律：绝不长连接——每次查询/写入新建连接，用完即焚。
+      铁律：绝不长连接——每次语句新建连接，用完即焚
+      （写入经 core.sqlbatch 攒批：N 行一条语句、一条连接，仍不跨批复用）。
 依赖: httpx>=0.27
       core.config (get_config)
       core.db (get_db, get_last_rowcount)
@@ -23,6 +24,7 @@ import httpx
 from .config import get_config
 from .db import get_db, get_last_rowcount
 from .http_client import local_client
+from .sqlbatch import SqlBatcher
 
 
 class EmbeddingError(RuntimeError):
@@ -56,6 +58,9 @@ class EmbeddingService:
         self.ttl_days: int = int(cfg.get("cache.ttl_days", 180))
 
         self._http = local_client(60.0)
+        # 缓存写入攒批器（惰性创建）：把逐条 upsert 攒成一条多值语句，
+        # 避免 3000+ chunk 的书每次 SQL 都新建连接、耗尽临时端口。
+        self._cache_batcher: SqlBatcher | None = None
 
     # ------------------------------------------------------------------
     # 公开接口
@@ -113,6 +118,7 @@ class EmbeddingService:
         vector = vectors[0]
 
         self._cache_set(text, vector)
+        self.flush_cache()  # 单条调用：立刻落库，不等攒批
         return vector
 
     def embed_batch(
@@ -143,8 +149,10 @@ class EmbeddingService:
 
         vectors: list[list[float] | None] = [None] * len(texts)
         miss_idx: list[int] = []
+        # 读也批量化：3109 条一次 IN 查询，而不是 3109 次连接
+        hit_map = self._cache_get_many(texts)
         for i, text in enumerate(texts):
-            cached = self._cache_get(text)
+            cached = hit_map.get(self._text_md5(text))
             if cached is not None:
                 vectors[i] = cached
             else:
@@ -163,6 +171,7 @@ class EmbeddingService:
             for k, i in enumerate(batch_idx):
                 vectors[i] = fetched[k]
                 self._cache_set(texts[i], fetched[k])
+            self.flush_cache()  # 每批 HTTP 结束刷一次，缓存在断点重跑时可用
             if progress:
                 progress(min(start + max_batch, len(miss_idx)), len(miss_idx))
 
@@ -224,6 +233,32 @@ class EmbeddingService:
     def _text_md5(self, text: str) -> str:
         return hashlib.md5(text.encode("utf-8")).hexdigest()
 
+    def _cache_get_many(self, texts: list[str]) -> dict[str, list[float]]:
+        """批量查缓存：N 个 hash 分成若干 IN 查询，返回 {text_hash: vector}。
+
+        命中即命中，未命中/坏数据一律视为 miss（由调用方重算并覆盖）。
+        每批 300 个 hash（约 10 KB SQL），避免单条语句过长。
+        """
+        if not texts:
+            return {}
+        pending = list({self._text_md5(t) for t in texts})
+        out: dict[str, list[float]] = {}
+        while pending:
+            chunk, pending = pending[:300], pending[300:]
+            placeholders = ",".join(["?"] * len(chunk))
+            rows = get_db().execute_sql(
+                "SELECT text_hash, vector_json FROM embedding_cache "
+                f"WHERE model = ? AND text_hash IN ({placeholders}) "
+                "AND (expires_at IS NULL OR expires_at > NOW())",
+                (self.model, *chunk),
+            )
+            for row in rows:
+                try:
+                    out[row["text_hash"]] = list(json.loads(row["vector_json"]))
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    continue  # 坏数据当未命中
+        return out
+
     def _cache_get(self, text: str) -> list[float] | None:
         """查缓存：MariaDB 主键查询（即弃连接，无长连接）。
 
@@ -245,29 +280,39 @@ class EmbeddingService:
             # 坏数据不阻断主线流程——下次写入覆盖
             return None
 
+    def _get_cache_batcher(self) -> SqlBatcher:
+        """惰性创建缓存攒批器（TTL 决定 expires_at 的写法，故按 tt l 建一次）。"""
+        if self._cache_batcher is None:
+            if self.ttl_days and self.ttl_days > 0:
+                # ttl 来自配置的整数，直接内联进模板（非用户输入，无注入面）
+                tmpl = (
+                    "(?, ?, ?, NOW(), DATE_ADD(NOW(), INTERVAL "
+                    f"{int(self.ttl_days)} DAY))"
+                )
+            else:
+                tmpl = "(?, ?, ?, NOW(), NULL)"
+            self._cache_batcher = SqlBatcher(
+                table="embedding_cache",
+                row_template=tmpl,
+                tail=(
+                    "ON DUPLICATE KEY UPDATE "
+                    "vector_json = VALUES(vector_json), "
+                    "expires_at = VALUES(expires_at)"
+                ),
+            )
+        return self._cache_batcher
+
+    def flush_cache(self) -> int:
+        """把攒着的缓存写入发出去；返回写出的行数（0 表示无待写）。"""
+        if self._cache_batcher is None:
+            return 0
+        return self._cache_batcher.flush()
+
     def _cache_set(self, text: str, vector: list[float]) -> None:
-        """写缓存：upsert 到 MariaDB（即弃连接，无长连接）。"""
+        """写缓存：只入队，由 flush_cache()/with 块统一多条一语句发出。"""
         text_hash = self._text_md5(text)
         payload = json.dumps(vector, ensure_ascii=False)
-        db = get_db()
-        if self.ttl_days and self.ttl_days > 0:
-            db.execute_sql(
-                "INSERT INTO embedding_cache "
-                "(text_hash, model, vector_json, created_at, expires_at) "
-                "VALUES (?, ?, ?, NOW(), DATE_ADD(NOW(), INTERVAL ? DAY)) "
-                "ON DUPLICATE KEY UPDATE vector_json = VALUES(vector_json), "
-                "expires_at = VALUES(expires_at)",
-                (text_hash, self.model, payload, self.ttl_days),
-            )
-        else:
-            db.execute_sql(
-                "INSERT INTO embedding_cache "
-                "(text_hash, model, vector_json, created_at, expires_at) "
-                "VALUES (?, ?, ?, NOW(), NULL) "
-                "ON DUPLICATE KEY UPDATE vector_json = VALUES(vector_json), "
-                "expires_at = NULL",
-                (text_hash, self.model, payload),
-            )
+        self._get_cache_batcher().add((text_hash, self.model, payload))
 
     # ------------------------------------------------------------------
     # 内部

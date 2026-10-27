@@ -311,7 +311,7 @@ def list_buckets() -> str:
 def list_tags(bucket: str | None = None) -> str:
     """列出知识库的标签及出现次数（标签云，按次数降序）。
 
-    标签是逗号分割的自由文本（如 "化学,地质学,解析素材3"），
+    标签是逗号分割的自由文本（如 "化学,地质学,<corpus-root>"），
     可用 search_docs 的 tags 参数圈定范围。
 
     参数:

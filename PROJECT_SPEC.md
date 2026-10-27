@@ -505,7 +505,8 @@ memoria-del-hielo/
 │   │
 │   ├── core/                    # 共享核心模块
 │   │   ├── __init__.py
-│   │   ├── db.py                # MariaDB 连接（即弃连接，不用池）
+│   │   ├── db.py                # MariaDB 连接（即弃连接，不用池；包限由服务端定）
+│   │   ├── sqlbatch.py          # 攒批写入（N 行一语句、探测包限、1153 拆批）
 │   │   ├── config.py            # 配置加载
 │   │   ├── embedding.py         # 嵌入向量缓存 + 调用
 │   │   ├── search.py            # 全文搜索 + 向量搜索

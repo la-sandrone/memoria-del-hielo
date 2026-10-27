@@ -3,8 +3,17 @@
 摘要: MariaDB 无状态短连接（即弃）访问层。
       execute_sql() 每次新建连接、用完即焚；transaction() 每事务一连接。
       连接池/信号量/健康检查全部移除——连接存活期 = 一个请求，无烂连接可言。
-      大包（巨书全文单行 >16MB）由服务端 max_allowed_packet 决定
-      （mariadb 驱动握手时自动跟随服务端值，无客户端参数）。
+
+      包大小（max_allowed_packet）由**服务端**决定，本层不设客户端参数；
+      但"即弃"不等于"一条语句一次连接"：批量写入走 core.sqlbatch 攒批，
+      攒批器在首次发送前 `SELECT @@session.max_allowed_packet` 探测一次，
+      把硬上限压到服务端值的 75%（只压不涨），并在运行中撞到
+      1153（ER_NET_PACKET_TOO_LARGE）时砍半上限 + 二分重发，行数不丢失。
+      详见 core/sqlbatch.py 顶部摘要。
+
+      为什么要攒批：每条一次连接的设计在 3000+ chunk 的长任务上会以
+      ~6000 次连接/本的速度耗尽 Windows 临时端口，客户端拿到的是
+      WSAEADDRINUSE **10048**（而不是常见的 10061），表现为"跑到一半突然连不上"。
 依赖: mariadb>=1.1
       core.config (get_config)
 """

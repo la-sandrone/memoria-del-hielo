@@ -5,7 +5,7 @@
 > 之前遇到个神奇的AI客户端，知识库后台是某个老版魔改版libsql，结果库大了检索五分钟，还不给单独搜索页面。
 > 正好作为Discuz! 5.X时代就来的老登，对MariaDB这套东西还算熟悉，遂用MCP Tool Call外加MariaDB的向量搜索以及BGE模型之类的东西攒了一套玩具工具。
 > **纯娱乐，不保证能长期用啊，更新看我自己需求。**
-> 充分学习PECMD和PECMD2012（ https://bbs.wuyou.net/forum.php?mod=viewthread&tid=205402 ）精神：短小精干，运行迅速（虽然我这里本质是大量复用已有轮子，悲）
+> 充分学习PECMD和PECMD2012（https://bbs.wuyou.net/forum.php?mod=viewthread&tid=205402）精神：短小精干，运行迅速（虽然我这里本质是大量复用已有轮子，悲）
 
 
 > ## ⚠️ 给所有读者（不管你是 LLM 还是人类）
@@ -143,9 +143,14 @@ MariaDB 的 `VECTOR KEY` 是 **HNSW（近似最近邻）**，不是精确 KNN。
 文献主推的 Score Gap 在本场景反而更差（AUROC 0.687 vs 原始相似度 0.859）——
 场景不同（书级主题型 vs chunk 级推理型），**结论不能照搬**。
 
-**3. 即弃连接**（`src/core/db.py`）
+**3. 即弃连接 + 攒批**（`src/core/db.py`、`src/core/sqlbatch.py`）
 不用连接池：每次调用新建连接、用完即焚。空闲时 `Threads_connected=1`、峰值 = 并行数；
 **"连接池里烂连接捞不回来"**那类问题从架构上消失，代价是每调用一次连接开销（本地库可忽略）。
+
+但"即弃"不等于"一条语句一次连接"：逐条 upsert 在大书上会以 ~6000 次连接/本
+耗尽 Windows 临时端口，客户端报 `WSAEADDRINUSE 10048`（跑到一半突然连不上）。
+所以写入走攒批——N 行拼一条多值 SQL，每次 flush 一条连接（3109 chunk / 6218 次 → ~108 次）。
+攒批器同时在首次发送前探测 `max_allowed_packet` 并按 75% 压顶，撞 `1153` 砍半拆批不丢行。
 
 **4. 知识库的边界：我们只对 md 负责，不越俎代庖处理 PDF**
 

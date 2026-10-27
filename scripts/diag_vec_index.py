@@ -105,7 +105,7 @@ def query(sql: str, params=None):
 
 
 def _as_path(raw: str) -> Path:
-    """Windows 侧原样用；WSL 侧把 D:\\... 折成 /mnt/d/...（同一 datadir 的两种视图）。"""
+    """Windows 侧原样用；WSL 侧把 D:\\... 折成 /mnt/<drive>/...（同一 datadir 的两种视图）。"""
     if os.name == "nt":
         return Path(raw)
     m = re.match(r"^([A-Za-z]):[\\/](.*)$", raw)
