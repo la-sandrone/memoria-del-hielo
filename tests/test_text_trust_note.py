@@ -50,10 +50,19 @@ def test_signal_reported_with_mode_and_counts():
     assert "另找资料旁证" in n
 
 
-def test_clean_computed_book_gives_no_note():
-    """已计算且全零 → 不给提示（docstring 里的普适提示仍在）。"""
-    assert _text_trust_note({"mineru_parse_mode": "ocr",
-                             "errata_stats": CLEAN_ERRATA}) == ""
+def test_clean_computed_book_still_warns():
+    """已计算且全零 → **仍然给一句**，且必须说清「这不等于干净」。
+
+    旧行为是返回 ""（字段不出现在 payload 里），实测在这里放过一本
+    「10 页 FAQ 冒充词典」的书：LLM 只看到 text_errata.counts 全 0，
+    无从知道判据压根没覆盖它的风险面。
+    """
+    n = _text_trust_note({"mineru_parse_mode": "ocr",
+                          "errata_stats": CLEAN_ERRATA})
+    assert n != ""
+    assert "视觉读数" in n
+    assert "未触发任何判据信号" in n
+    assert "不等于原文准确" in n
 
 
 def test_unknown_parse_mode_is_not_printed_as_english():

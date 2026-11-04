@@ -50,7 +50,7 @@ from ..core.db import get_db
 from ..core.embedding import get_embedding_service
 from ..core.image_pipeline import get_image_pipeline
 from ..core.mineru_postprocess import MineruPostprocessor, get_mineru_postprocessor
-from ..core.text_errata import count_errata
+from ..core.text_errata import count_errata, merge_errata
 from ..core.mineru_schema import FORM_DIR, FORM_FLAT, FORM_FULL
 from ..core.tags import validate_single_tag, validate_write_tags
 from ..core.tokenizer import tokenize_cjk_ub
@@ -235,8 +235,14 @@ class BookImporter:
         stop_check: Callable[[], bool] | None = None,
         identity_path: Path | None = None,
         work_note: str | None = None,
+        untrusted_note: str = "",
     ) -> dict[str, Any]:
         """导入单个图书文件（书 + 全部 chunk 单事务原子提交）。
+
+        untrusted_note: 人给的「本书内容不可信」注记（`--untrusted`）。
+            非空则并入 errata_stats.notes，source 记 `import:--untrusted`，
+            **在写入第一段事务时就算上** —— 导入中途崩了重跑，注记跟着重来，
+            不会出现「书进去了但标记丢了」这种半截状态。
 
         identity_path: 这本书在**用户磁盘上的身份**。缺省 = file_path。
             只有 zip 输入会给出不同的值：那时 file_path 是 cache 里的解包正文
@@ -385,6 +391,14 @@ class BookImporter:
         # 机械那部分（形近串写 / 行尾断词 / 成串汉字 / 康熙部首 / PUA）由判据算；
         # 「每本书不一样」的外部注记走 mhi annotate 事后富化，合并进同一列。
         errata = count_errata(text)
+        if untrusted_note:
+            # 人给的判断（CLI --untrusted）与机械计数**合并进同一列**：
+            # 两张表会让「这本书可不可信」变成两次查询，迟早只查一处。
+            # 走 merge_errata 而不是手工塞 notes，是为了复用它的去重与
+            # 「未知键必须自带释义」的纪律。
+            errata = merge_errata(
+                errata, {}, "import:--untrusted", note=untrusted_note
+            )
         chunks = chunk_markdown(
             text,
             target_chars=self.target_chars,
@@ -546,8 +560,13 @@ class BookImporter:
         parallel: int = 1,
         index_offset: int = 0,
         grand_total: int = 0,
+        untrusted_note: str = "",
     ) -> list[dict[str, Any]]:
         """递归导入目录下全部可导入文件（.md/.txt/MinerU zip；书库搬家入口）。
+
+        untrusted_note: 「人判断这批不可信」的注记，**整批**写进每本书的
+        errata_stats.notes（不做内容启发式筛选 —— 那是 calling side 的判断，
+        这里只负责如实搬运）。
 
         index_offset / grand_total: 书级计数器 `[X/N]` 的**全局**坐标。
         用户裁定：N 要是「本次命令行一共处理的 md/txt 数」，不是每次
@@ -619,6 +638,7 @@ class BookImporter:
                     cand, bucket, manual_tags, category_tag, force,
                     verbose=False, progress_tracker=tracker,
                     stop_check=lambda: _INTERRUPTS[0] >= 1,
+                    untrusted_note=untrusted_note,
                 )
 
             try:
@@ -752,7 +772,8 @@ class BookImporter:
             )
             try:
                 result = self.import_candidate(
-                    cand, bucket, manual_tags, category_tag, force
+                    cand, bucket, manual_tags, category_tag, force,
+                    untrusted_note=untrusted_note,
                 )
                 results.append(result)
                 logger.info(
@@ -797,6 +818,7 @@ class BookImporter:
         verbose: bool = True,
         progress_tracker: ProgressTracker | None = None,
         stop_check: Callable[[], bool] | None = None,
+        untrusted_note: str = "",
     ) -> dict[str, Any]:
         """把一个**候选路径**导入成一本书：md/txt 直通；zip 先物化再按 md 导入。
 
@@ -809,7 +831,7 @@ class BookImporter:
             return self.import_file(
                 cand, bucket, manual_tags, category_tag, force,
                 verbose=verbose, progress_tracker=progress_tracker,
-                stop_check=stop_check,
+                stop_check=stop_check, untrusted_note=untrusted_note,
             )
         m = materialize_zip(cand, stop_check=stop_check)
         return self.import_file(
@@ -818,6 +840,7 @@ class BookImporter:
             stop_check=stop_check,
             identity_path=cand,
             work_note=describe_zip(m),
+            untrusted_note=untrusted_note,
         )
 
     @staticmethod
@@ -998,6 +1021,7 @@ def import_book_file(
     tags: str = "",
     category_tag: str = "",
     force: bool = False,
+    untrusted_note: str = "",
 ) -> dict[str, Any]:
     p = Path(path_str)
     # 显式点名一个裸结构 JSON：当场拒绝并指路，别让它走到后面才以
@@ -1005,9 +1029,12 @@ def import_book_file(
     refuse_explicit_mineru_json(p)
     if p.suffix.lower() == ".zip":
         return BookImporter().import_candidate(
-            p, bucket, tags, category_tag, force
+            p, bucket, tags, category_tag, force,
+            untrusted_note=untrusted_note,
         )
-    return BookImporter().import_file(p, bucket, tags, category_tag, force)
+    return BookImporter().import_file(
+        p, bucket, tags, category_tag, force, untrusted_note=untrusted_note
+    )
 
 
 def import_book_directory(
@@ -1019,6 +1046,7 @@ def import_book_directory(
     parallel: int = 1,
     index_offset: int = 0,
     grand_total: int = 0,
+    untrusted_note: str = "",
 ) -> list[dict[str, Any]]:
     if parallel > 2:
         logger.warning(
@@ -1029,6 +1057,7 @@ def import_book_directory(
     return BookImporter().import_directory(
         Path(path_str), bucket, tags, recursive, force,
         index_offset=index_offset, grand_total=grand_total,
+        untrusted_note=untrusted_note,
     )
 
 

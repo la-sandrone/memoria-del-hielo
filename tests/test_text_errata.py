@@ -14,6 +14,7 @@ import json
 from src.core.text_errata import (
     CRITERIA_VERSION,
     SIGNAL_GLOSSARY,
+    UNTRUSTED_DEFAULT_NOTE,
     count_errata,
     errata_payload,
     fired_signals,
@@ -35,7 +36,13 @@ def test_clean_russian_book_has_no_signals():
     assert e["words"] > 0
     assert fired_signals(e) == []
     assert "not_applicable" not in e
-    assert render_errata_note(e, "txt") == ""
+    # 「算了没触发」**也要说话**：判据只覆盖它认识的那几类误差，静默等于
+    # 让消费方把 0 读成「原文干净」。实测教训：拉丁/希腊语书在 v1 下全 0，
+    # 而它们的真正风险（长音符、多调调符、U+FFFD）一个都不在判据里。
+    n = render_errata_note(e, "txt")
+    assert n != ""
+    assert "未触发任何判据信号" in n
+    assert "不等于原文准确" in n
 
 
 def test_script_mix_counts_lookalike_substitution():
@@ -268,3 +275,51 @@ def test_zero_audit_signal_does_not_fire():
     """pages_short=0 是「页数一致」，不是「有问题」——不该占渲染位。"""
     e = merge_errata(count_errata(CLEAN), {"pages_short": 0}, "audit")
     assert "pages_short" not in fired_signals(e)
+
+
+# ── 人工注记（--untrusted）与「人话优先于机械计数」────────────────
+
+
+def test_untrusted_default_note_mentions_web_search():
+    """默认文案**必须**含「联网搜索」。
+
+    为什么是硬要求：没有这一句，模型会把「上下文说得通」当唯一判据，
+    而幻觉的判据恰恰就是「说得通」—— 旁证只能来自本书之外。
+    """
+    assert "联网搜索" in UNTRUSTED_DEFAULT_NOTE
+    assert "不可信" in UNTRUSTED_DEFAULT_NOTE
+    assert "核对上下文" in UNTRUSTED_DEFAULT_NOTE
+
+
+def test_note_rendered_before_mechanical_signals():
+    """注记是**人**的判断，必须排在机械计数之前（埋在释义后等于没写）。"""
+    e = merge_errata(count_errata(CLEAN), {}, "import:--untrusted",
+                     note=UNTRUSTED_DEFAULT_NOTE)
+    text = "Φacmep писал про nуть."          # 造一个 script_mix 信号
+    e = merge_errata(count_errata(text), {}, "import:--untrusted",
+                     note=UNTRUSTED_DEFAULT_NOTE)
+    n = render_errata_note(e, "ocr")
+    assert "注记[import:--untrusted]" in n
+    # 注记行号 < 信号释义行号（后者带「（script_mix）」）
+    lines = n.splitlines()
+    i_note = next(i for i, x in enumerate(lines) if "注记[" in x)
+    i_sig = next(i for i, x in enumerate(lines) if "（script_mix）" in x)
+    assert i_note < i_sig
+
+
+def test_untrusted_note_alone_gives_note():
+    """只有注记、零信号时也要渲染（且首行不能出现「观测到 。」这种空壳）。"""
+    e = merge_errata(count_errata(CLEAN), {}, "annotate:--untrusted",
+                     note="扫描件，符号系统整体崩塌")
+    n = render_errata_note(e, "txt")
+    assert "注记[annotate:--untrusted]" in n
+    assert "观测到 。" not in n
+    assert "未触发任何判据信号" in n
+
+
+def test_note_not_duplicated_on_reimport():
+    """同一 (source,text) 重复合并不累加 —— 重导不该长出第二条一样的注记。"""
+    e = count_errata(CLEAN)
+    for _ in range(3):
+        e = merge_errata(e, {}, "import:--untrusted", note=UNTRUSTED_DEFAULT_NOTE)
+    assert len(e["notes"]) == 1

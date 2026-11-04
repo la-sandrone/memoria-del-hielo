@@ -72,8 +72,11 @@
     · mhi_import_chat.py / mhi_import_onenote.py
     · mhi_clean_chat.py / mhi_search.py / mhi_tag.py（tag 增删查 + --audit 全库 tag 体检，退出码 1 表异常）
     · mhi_find_book.py（书级语义检索：找书；别名 `mhi find`）
+    · mhi_annotate.py（**事后富化** errata_stats：`--from manifest` 批量 ｜
+      `--guid/--path` + `--untrusted [TEXT]` 直连。默认 dry-run；存的是
+      「人判断这本书不可信」这类机械判据写不出的东西）
     · mhi_cleanup_images.py / mhi_reset_db.py
-    关键词: CLI, click, 删书, 并行导入, mhi 转发器, find-book
+    关键词: CLI, click, 删书, 并行导入, mhi 转发器, find-book, annotate, untrusted
 11. src/mcp_server.py — FastMCP 服务器，7 个只读工具（检索 + 发现 + 会话）
     · search_docs（找内容，chunk 级 + rerank 精排）/ find_books（找书，书级语义排序；
       **不判存在性**，理由见 docs/真实检索查询分布案例.md §五）/ read_book_chunk（S2B 钻取）
@@ -178,6 +181,11 @@
 - \"MinerU 脚注丢失/图片引用\" → src/core/mineru_postprocess.py + docs/CLI_USAGE.md §10
 - "PDF 读出来的字为什么是错的 / 我们承诺到哪一步" → README「闲话经验」§4 + 「免责」+ docs/…屁股.md §5
 - "知识库要不要处理 PDF / 文本可信度提示在哪" → README「闲话经验」§4 + src/mcp_server.py 三个工具的 docstring
+- "这批书是扫描件，怎么标不可信 / 怎么让模型知道要联网旁证" → `mhi import ... --untrusted`（整批）
+  或 `mhi note -g G -u`（事后）；实现见 src/core/text_errata.py 的
+  `UNTRUSTED_DEFAULT_NOTE` + `render_errata_note`，PROJECT_SPEC §4「外部注记入口」
+- "警告为什么消失 / 为什么模型不知道这本书不可信" → `render_errata_note` 的两条出口
+  （`{}` = 未计算；非空全 0 = 已算但无信号，**也要说**）+ `text_trust` 字段
 - "为什么不能全文 NFKC / Unicode 版本对不上怎么办" → 20 §1.2, §2（docs/…屁股.md）
 - "哪些坑是上游的、哪些是我们自己的" → 20 §七（**先看这节**）
 - "为什么向量路不在乎部首 / 为什么全文搜不到中文词" → 20 §8

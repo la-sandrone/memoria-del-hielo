@@ -1,11 +1,18 @@
 """
 文件名: mhi_annotate.py
-摘要: CLI: mhi-annotate --from <manifest.jsonl|manifest.csv> [--apply]
-      按 manifest 给**已入库的书**合并误差统计/注记（事后富化）。
+摘要: CLI: mhi note（规范名 mhi-annotate）—— 给**已入库的书**合并误差统计/注记。
+      两条入口：
+        · 批量：--from <manifest.jsonl|manifest.csv>
+        · 直连：--guid/-g、--path/-p ＋ --untrusted/-u [TEXT]
 
       为什么需要它：机械那部分误差（形近串写 / 断词 / 成串汉字 / 康熙部首 / PUA）
       由导入器按同一套判据自动算，但**每本书的情况不一样** —— 离线扫描、人工翻看、
-      LLM 判断出来的东西，代码里写不出规则。manifest 就是那个外部产出的入口。
+      「这批是扫描件、符号系统整体崩」这类判断，代码里写不出规则。manifest 与
+      --untrusted 就是那两个外部入口，殊途同归到 errata_stats.notes。
+
+      `mhi note -g <guid> -u -y`：最常用的形状（短选项是给手伤场景留的）。
+      注记的 source 记 `annotate:--untrusted`，与导入时的 `import:--untrusted`、
+      离线审计的 `audit_zip.py@日期` 分开 —— 三种来源可信度不同。
 
       **默认 dry-run**（不给 --apply 只报会改什么）—— 因为匹配错了会把注记挂到
       别的书上，而且这种错误**不报错、只静默污染**。
@@ -52,10 +59,13 @@ from ..core.db import get_db
 from ..core.text_errata import (
     _COUNT_KEYS,
     SIGNAL_GLOSSARY,
+    UNTRUSTED_DEFAULT_NOTE,
     merge_errata,
 )
 
-_MATCH_KEYS = ("content_md5", "source_path", "title")
+# 匹配键按 robustness 降序。guid 最硬（本库自己发的，永不重名）；
+# content_md5 次之（要全库算一次 md5）；title 最软（重名即拒绝）。
+_MATCH_KEYS = ("guid", "content_md5", "source_path", "title")
 _META_COLS = ("match", "errata", "glossary", "note", "source")
 
 
@@ -148,12 +158,15 @@ def _match(rec: dict, index: list[dict]) -> tuple[dict | None, str]:
     """返回 (命中的书, 失败原因)。多本命中 → (None, 原因)。"""
     spec = rec.get("match") or {}
     if not spec:
-        return None, "没有 match 段（至少给 source_path / title / content_md5 之一）"
+        return None, "没有 match 段（至少给 guid / source_path / content_md5 / title 之一）"
     for key in _MATCH_KEYS:
         want = spec.get(key)
         if not want:
             continue
-        if key == "content_md5":
+        if key == "guid":
+            want_g = str(want).strip().lower()
+            hits = [b for b in index if (b.get("guid") or "").lower() == want_g]
+        elif key == "content_md5":
             want_c = str(want).strip().lower()
             hits = [b for b in index if (b.get("body_md5") or "") == want_c]
         elif key == "source_path":
@@ -166,24 +179,55 @@ def _match(rec: dict, index: list[dict]) -> tuple[dict | None, str]:
         if len(hits) > 1:
             return None, (f"{key} 命中 {len(hits)} 本，拒绝静默取第一条"
                           f"（{', '.join((h.get('key_metadata') or '')[:24] for h in hits[:3])}）")
-    return None, "三个匹配键都没命中（路径可能改过名，试试 content_md5 或 title）"
+    return None, "匹配键都没命中（路径可能改过名，试试 guid 或 content_md5）"
 
 
 @click.command("mhi-annotate")
-@click.option("--from", "from_", required=True,
+@click.option("--from", "from_", default=None,
               help="manifest 文件（.jsonl 或 .csv），绝对路径")
-@click.option("--apply", is_flag=True, help="真的写库（默认 dry-run，只报会改什么）")
+@click.option("-g", "--guid", "guids", multiple=True,
+              help="直接点名一本书（可重复）；配 --untrusted 用")
+@click.option("-p", "--path", "paths", multiple=True,
+              help="按原始文件路径点名（可重复；盘符/反斜杠会自动归一）")
+@click.option("-u", "--untrusted", "untrusted", is_flag=False,
+              flag_value=UNTRUSTED_DEFAULT_NOTE, default=None, metavar="[TEXT]",
+              help="手动标注该书「扫描内容不可信」（不带值时用内置文案："
+                   "核对上下文 + 补充联网搜索）。只能配 --guid/--path")
+@click.option("-y", "--apply", is_flag=True,
+              help="真的写库（默认 dry-run，只报会改什么）")
 @click.option("--replace", is_flag=True,
               help="丢弃已有的注记与外部键，完全按 manifest 重算（默认是合并）")
 @click.option("--show", default=20, show_default=True, help="每类最多列几行明细")
-def main(from_: str, apply: bool, replace: bool, show: int):
-    mpath = Path(from_)
-    if not mpath.is_file():
-        raise click.ClickException(f"manifest 不存在: {mpath}")
+def main(from_: str | None, guids: tuple[str, ...], paths: tuple[str, ...],
+         untrusted: str | None, apply: bool, replace: bool, show: int):
+    direct = bool(guids or paths)
+    if from_ and direct:
+        raise click.ClickException(
+            "--from 与 --guid/--path 互斥（manifest 已带 match 段，别再点名）")
+    if not from_ and not direct:
+        raise click.ClickException(
+            "要么 --from <manifest>，要么用 --guid/--path 点名一本书")
+    if direct and untrusted is None:
+        raise click.ClickException(
+            "--guid/--path 必须配 --untrusted（否则没有要写的内容）")
 
-    recs = _load_jsonl(mpath) if mpath.suffix.lower() == ".jsonl" else _load_csv(mpath)
-    click.echo(f"manifest {mpath.name}：{len(recs)} 条记录；"
-               f"模式 {'APPLY' if apply else 'dry-run（不写库）'}")
+    if direct:
+        # 直连模式：把每个点名包成与 manifest 同形的 rec，后面走同一条落库路径。
+        # source 写死带 CLI 前缀 —— 事后能分清「导入时标的」与「事后补的」。
+        src = "annotate:--untrusted"
+        recs = [{"match": {"guid": g}, "note": untrusted, "source": src}
+                for g in guids]
+        recs += [{"match": {"source_path": p}, "note": untrusted, "source": src}
+                 for p in paths]
+        click.echo(f"点名 {len(recs)} 本；模式 {'APPLY' if apply else 'dry-run（不写库）'}")
+    else:
+        mpath = Path(from_)
+        if not mpath.is_file():
+            raise click.ClickException(f"manifest 不存在: {mpath}")
+        recs = (_load_jsonl(mpath) if mpath.suffix.lower() == ".jsonl"
+                else _load_csv(mpath))
+        click.echo(f"manifest {mpath.name}：{len(recs)} 条记录；"
+                   f"模式 {'APPLY' if apply else 'dry-run（不写库）'}")
     if not recs:
         return
 

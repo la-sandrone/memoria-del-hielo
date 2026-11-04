@@ -7,6 +7,116 @@
 
 ---
 
+## 2026-11-04 — `--untrusted`：把「人说过的话」送进模型，顺手堵掉「0 = 干净」
+
+### 动机
+
+入库 8 本古典学/语言学书（西语正字法、希腊-拉丁比较语法、印欧语导论、俗拉丁等），
+全是扫描或文本层不可靠的 PDF。现有机制本身是成熟的（`errata_stats` + `text_trust`
++ `mhi annotate --from manifest`），但实测发现它对这批书**基本不会说话**：
+
+| 书 | parse_mode | v1 触发 | 真正会坏的地方（v1 不统计） |
+|---|---|---|---|
+| Sihler 希拉比较语法 | ocr | script_mix, hyphen_break | 长音符 21205、多调希腊 7672、喉音下标 1841 |
+| Weiss 拉丁史比 | ocr | script_mix, hyphen_break | 长音符 10652、多调希腊 1004 |
+| Fortson 印欧语 | ocr | script_mix | 长音符 5252、IAST 414 |
+| Herman 俗拉丁 | **txt** | script_mix | **U+FFFD 16**、IPA 与开闭元音符号整体崩 |
+
+三条根因：
+
+1. **v1 判据是为俄语语料定的。** 库内 1444 本全已计算，`script_mix` 前 12 名
+   清一色俄语/教会斯拉夫语（66076、28511…）。这批书没有西里尔字母，判据天然趴地板上
+   —— **判据不适用，不是书干净**。
+2. **`parse_mode=txt` 不保证质量。** Herman 标称 txt（措辞是相对乐观的「文本层读数」），
+   实际 `Vulgar Latin � and Q`、`[�]`、`vig� inti` —— 音标系统整体崩塌。
+3. **「全 0 静默」最危险。** `render_errata_note` 在没有触发键时 `return ""`，
+   `text_trust` 字段**根本不出现**，只剩 `text_errata.counts` 全 0。实测放过一本
+   「10 页 FAQ 冒充 800 页词典」的书（`Diccionario panhispánico`，源 PDF 464 KB / 10 页 /
+   iText 生成，内容是 RAE 网站 FAQ 页）——LLM 会读到「误差统计：无」。
+
+### 改了什么
+
+| 变更 | 位置 |
+|---|---|
+| `UNTRUSTED_DEFAULT_NOTE`（含**「补充联网搜索做旁证」**）+ 人工注记的默认文案 | `core/text_errata.py` |
+| 渲染：**注记提到信号释义之前**（人的判断 > 机械计数）；全 0 也回一句「这不等于原文准确」 | `render_errata_note` |
+| 修 `bits` 为空的隐藏 bug：只有注记没信号时，首行会出现「观测到 。」 | 同上 |
+| `--untrusted [TEXT]`（可选值：裸用取默认文案） | `mhi-annotate` / `mhi-import-book` 两处 |
+| `mhi annotate --guid/--path` 直连模式（不必写 manifest） | `mhi_annotate.py` |
+| 注记落到 `errata_stats.notes`，`source` 记 `import:--untrusted` / `annotate:--untrusted` | `book_importer.py` |
+
+**为什么 `source` 要带前缀**：事后能分清「导入时标的」与「事后补的」、
+以及「离线审计（`audit_zip.py@日期`）说的」——三种来源的可信度不同，
+混成一个 `manual` 就再也分不开了。
+
+**为什么注记只走 `notes` 不开新键**：`merge_errata` 已有去重、`notes` 已有渲染位，
+且 `render_errata_note` 早就不会因为「fired 为空」把注记丢掉。开新键要多登记一次
+词表、多一处渲染分支，换不来任何东西。
+
+**为什么必须写「联网搜索」**：没有这一句，模型会把「上下文说得通」当唯一判据 ——
+而幻觉的判据恰恰就是「说得通」。旁证只能来自本书之外。
+
+### 边界（这次刻意不做）
+
+- **判据覆盖没扩**：长音符 / 多调希腊 / IAST 下加点 / 上标喉音这些信号**仍未统计**。
+  它们对这批书是核心记号，但「预组合 vs 组合」在原生电子书里也可能正常出现，
+  先要标定误报率再进词表。**当前靠 `--untrusted` 人工兜**。
+- **U+FFFD 也没进判据**（它是全库最硬的证据：编码层自己承认读不出）。
+  同样待与 v2 一起做，避免这次把「行为变更」摊太宽。
+
+### 测试
+
+`pytest tests/` → **340 passed**（新增 `tests/test_annotate_cli.py` 10 例、
+`tests/test_untrusted_passthrough.py` 4 例，改 `test_text_errata.py` /
+`test_text_trust_note.py` 各一条断言：旧的「全 0 → 返回空串」是**有意变更的**
+行为，测试跟着改成断言「必须说话」）。
+
+> 踩坑记录：首次跑全量时 `test_rate_limiter.py` 有 21 条报
+> `Failed: async def functions are not natively supported`，当时我归因为
+> 「缺 `pytest-asyncio`」并写进了本文件，随后又因复跑变绿改口成「归因错了」。
+> **真因就是缺包** —— 用户装上 `pytest-asyncio` 后稳定 21 passed。
+> 教训：环境类失败在「重跑变绿」时不要急着否定原假设，先确认环境有没有被改过。
+
+### 入库实况（8 本，18.17 M 字符 / 10,395 chunk）
+
+| 书 | 读数 | 档位 | 字符 | chunk | 判据触发 | 注记 |
+|---|---|---|---|---|---|---|
+| Diccionario panhispánico de dudas **2005** | ocr | standard | 3,929,245 | 2187 | hyphen_break 57 | ✓ |
+| New Comparative Grammar of Greek and Latin (Sihler) | ocr | standard | 4,599,181 | 2592 | script_mix **2278** | ✓ |
+| Outline of the Hist. & Comp. Grammar of Latin (Weiss) | ocr | standard | 2,224,727 | 1271 | script_mix 699 | ✓ |
+| Social Variation and the Latin Language (Adams) | ocr | standard | 2,398,803 | 1411 | script_mix 9 | ✓ |
+| Indo-European Language and Culture (Fortson) | ocr | standard | 1,630,077 | 962 | script_mix 263 | ✓ |
+| Romance Languages: A Historical Introduction | ocr | standard | 885,058 | 493 | script_mix 54 | ✓ |
+| Vulgar Latin (Herman) | txt | standard | 317,191 | 192 | script_mix 2 | ✓ |
+| Ortografía de la lengua española 2010 | txt | flash | 2,187,083 | 1287 | script_mix 6 | **无（刻意）** |
+
+**`panhispánico` 换了真源。** 首次入库用的是 464 KB / 10 页的 RAE 网站 FAQ PDF
+（iText 生成、`DESPUÉS DE…` 那类页面），比原书 800+ 页少两个数量级。用户换源后
+重导为 **2005 版、3.93 M 字符、2187 chunk**。旧记录由 `--force` 级联删除。
+教训：**`errata_stats` 全 0 不等于书是好的** —— 那本假书的 `script_mix` 是 0，
+判据完全看不出「这不是一本书」。
+
+**Ortografía 刻意不带 `--untrusted`。** 它上游是 **epub**，不是扫描件；
+`UNTRUSTED_DEFAULT_NOTE` 里「本书为扫描件」这句话对它是**错误断言**。
+它的实际风险（epub 结构解析 + `tier=flash` 低档模型）与该文案的指向不同，
+宁可留空也不硬套一个错的标签。
+
+> 这一条是踩出来的：我误判为「漏标」并用 `mhi note -u` 补上，被用户当场纠正
+> （「它的上游是 epub」）。已按 `source=annotate:--untrusted` 精确删除那条注记，
+> 其余计数键保持不变。
+> **它暴露的局限**：默认文案把「扫描件」写死在句首，凡是上游不是扫描件、
+> 但同样不可靠的场景（epub/OCR 后处理/pandoc 转换），这句话就用不了。
+> 真正的解法不是改文案，而是**不适用的就别标** —— 硬套一个错误断言的坏处，
+> 比没有警告更大。
+
+`script_mix` 的分布值得记一笔：Sihler 2278 次远高于其余（它的 PDF 是 1416 页，
+约原书 686 页的两倍，疑似双页扫描）；其余在 2–699 之间。
+**但这不是「有了这些数就够了」** —— 这批书真正会坏的长音符（Sihler 21205）、
+多调希腊语（7672）、IAST 下加点（687）**一个都不在 v1 判据里**，
+所以那 7 本的 `--untrusted` 注记才是它们仅有的护栏。
+
+---
+
 ## 2026-10-27 — 攒批写入：6218 次连接 → 108 次，顺手治好 10048
 
 ### 动机

@@ -23,6 +23,7 @@ import os
 import sys
 from pathlib import Path
 from ..core.db import get_db
+from ..core.text_errata import UNTRUSTED_DEFAULT_NOTE
 from ..importers.book_importer import (
     SRC_EXTS,
     MiddleJsonInputError,
@@ -53,6 +54,12 @@ from ..importers.book_importer import (
 @click.option(
     "--exclude-dirs", default="", help="排除的一级子目录名，英文逗号分割"
 )
+@click.option(
+    "-u", "--untrusted", "untrusted", is_flag=False,
+    flag_value=UNTRUSTED_DEFAULT_NOTE, default=None, metavar="[TEXT]",
+    help="整批标注「扫描件内容不可信」（不带值时用内置文案：核对上下文 + "
+         "补充联网搜索）。一次命令行 = 一批，flag 作用于全部 PATH",
+)
 def main(
     paths: tuple[str, ...],
     bucket: str | None,
@@ -61,6 +68,7 @@ def main(
     force: bool,
     no_dir_tag: bool,
     exclude_dirs: str,
+    untrusted: str | None,
 ):
     """导入图书/游戏剧情文件到知识库（chunk 层，幂等可断点续传）。
 
@@ -69,6 +77,10 @@ def main(
     的 N 是**全部 PATH 的可导入文件总数**（.md / .txt / MinerU 的 .zip），
     X 跨 PATH 连续累加 —— 一次命令行 = 一次作业。
     （每 PATH 各配一套参数的 ffmpeg 式语法见需求清单，尚未实施。）
+
+    --untrusted：**整批生效**（与 --tags 同语义）。落进 errata_stats.notes，
+              在 MCP 每次返回正文时贴给模型 —— 那是仓储里唯一「人说过的话」
+              能到达模型的地方，机械判据算不出的风险只能从这里兜。
 
     Ctrl+C 两级语义：第一次中断当前书（该书未入库，继续下一本）；
     第二次停止全部（已导书保留）。
@@ -98,6 +110,7 @@ def main(
                             x, bucket, tags, recursive, force, no_dir_tag,
                             exclude_dirs,
                             index_offset=seen, grand_total=grand_total,
+                            untrusted_note=untrusted or "",
                         )
                     )
                     seen += n
@@ -106,7 +119,8 @@ def main(
                     # 单文件入口自身不打印书级行 ⟹ 这里补，保持序号连续
                     click.echo(f"[{seen}/{grand_total}] {x.name}", err=True)
                     results.append(
-                        import_book_file(str(x), bucket, tags, force=force)
+                        import_book_file(str(x), bucket, tags, force=force,
+                                         untrusted_note=untrusted or "")
                     )
             except MiddleJsonInputError as exc:
                 click.echo(
@@ -179,7 +193,8 @@ def _count_path(p: Path, recursive: bool, no_dir_tag: bool, excluded: set) -> in
 
 
 def _import_dir(p: Path, bucket, tags, recursive, force, no_dir_tag, exclude_dirs,
-                index_offset: int = 0, grand_total: int = 0):
+                index_offset: int = 0, grand_total: int = 0,
+                untrusted_note: str = ""):
     """目录导入：默认一级子目录分派（tag = 子目录名，与 --tags 叠加）。
 
     · 子目录分派模式：子目录内部一律 recursive=True（书名目录/auto 嵌套结构）
@@ -217,6 +232,7 @@ def _import_dir(p: Path, bucket, tags, recursive, force, no_dir_tag, exclude_dir
                     import_book_directory(
                         str(d), bucket, tags, recursive=True, force=force,
                         index_offset=seen, grand_total=grand_total,
+                        untrusted_note=untrusted_note,
                     )
                 )
                 seen += n
@@ -227,13 +243,15 @@ def _import_dir(p: Path, bucket, tags, recursive, force, no_dir_tag, exclude_dir
                 # 单文件入口自己不打印书级行 ⟹ 这里补，保持序号连续不断档
                 click.echo(f"[{seen}/{grand_total}] {f.name}", err=True)
                 results.append(
-                    import_book_file(str(f), bucket, tags, force=force)
+                    import_book_file(str(f), bucket, tags, force=force,
+                                     untrusted_note=untrusted_note)
                 )
             return results
     return import_book_directory(
         str(p), bucket, tags, recursive=recursive, force=force,
         index_offset=index_offset,
         grand_total=grand_total or len(_safe_glob_src(p, recursive)),
+        untrusted_note=untrusted_note,
     )
 
 

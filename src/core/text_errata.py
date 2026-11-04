@@ -166,6 +166,20 @@ _DETAIL_KEYS: dict[str, str] = {"accented_latin": "script_mix"}
 _RATIO_SIGNALS: tuple[str, ...] = ("script_mix",)
 
 
+# ── 人工注记的默认文案（`--untrusted` 不带值时用它）──────────────────
+# 为什么放在这里：import 与 annotate 两条 CLI 都要写这句话，两处各抄一份
+# 必然漂移（D9 范式的老教训）。判据在哪个文件，人话也在哪个文件。
+#
+# 为什么必须写「补充联网搜索」：没有这一句，模型会拿「上下文说得通」当唯一
+# 判据 —— 而幻觉的判据就是「说得通」。旁证只能来自本书之外。
+UNTRUSTED_DEFAULT_NOTE = (
+    "本书为扫描件/不可靠解析产物，识别结果**有较大风险不可信**"
+    "（形近字、断词、重音与符号丢失都可能发生）。"
+    "**务必核对上下文，并补充联网搜索做旁证** —— "
+    "不要只凭本书内容下结论，也不要因为读起来通顺就当作原文。"
+)
+
+
 def is_computed(errata: Any) -> bool:
     """`{}` 是唯一的「未计算」标记；任何非空 dict 都算有记录。
 
@@ -370,7 +384,13 @@ def errata_payload(errata: dict[str, Any], parse_mode: str = "") -> dict[str, An
 
 
 def render_errata_note(errata: dict[str, Any], parse_mode: str = "") -> str:
-    """把 errata 渲染成给 LLM 的一句话（+ 触发键的释义行）。无信号则返回 ""。"""
+    """把 errata 渲染成给 LLM 的一段话（首行结论 + 注记 + 触发键释义）。
+
+    无信号且无注记时**也**返回一段：**「算了没触发」不是「原文干净」**。
+    判据只覆盖它认识的那几类误差（且是按语料定的），这之外的识别错误
+    （符号丢失、重音错位、生僻字母被读成拉丁字母）不会被统计 —— 静默
+    什么都不说，消费方就会把「0」读成好消息。宁可每次多花几十 token。
+    """
     if not is_computed(errata):
         return (
             "⚠️ 本书无误差统计记录（迁移 007 之前导入，或非本库算的）。"
@@ -388,8 +408,6 @@ def render_errata_note(errata: dict[str, Any], parse_mode: str = "") -> str:
                       "glossary", "unregistered")
         and isinstance(v, int) and v > 0
     ]
-    if not fired and not own_keys and not errata.get("notes"):
-        return ""
 
     words = errata.get("words") or 0
     bits: list[str] = []
@@ -412,7 +430,22 @@ def render_errata_note(errata: dict[str, Any], parse_mode: str = "") -> str:
     for key in sorted(own_keys):
         bits.append("%s %s 处" % (key, errata[key]))
 
-    lines = ["⚠️ 本书文本可信度：%s；观测到 %s。" % (how, "、".join(bits))]
+    # 首行结论：有信号就报信号；**没有信号也要说清「这不等于干净」**。
+    if bits:
+        head = "⚠️ 本书文本可信度：%s；观测到 %s。" % (how, "、".join(bits))
+    else:
+        head = (
+            "⚠️ 本书文本可信度：%s；已算误差统计但**未触发任何判据信号** —— "
+            "这不等于原文准确。判据只覆盖形近串写/行尾断词/成串汉字/康熙部首/PUA "
+            "这几类，其他识别错误（符号与重音丢失、生僻字母被读成拉丁字母、"
+            "表格错行）不在统计内。" % how
+        )
+
+    lines = [head]
+    # 注记优先于机械计数：那是**人**的判断（离线扫描 / 人工翻看 / LLM 判读），
+    # 而 count_errata 只认它能机械识别的几类。埋在信号释义后面等于没写。
+    for note in (errata.get("notes") or [])[:3]:
+        lines.append("  · 注记[%s]：%s" % (note.get("source", "?"), note.get("text", "")))
     for key in fired:
         g = SIGNAL_GLOSSARY[key]
         seg = "  · %s（%s）：%s" % (g["label"], key, g["what"])
@@ -420,8 +453,6 @@ def render_errata_note(errata: dict[str, Any], parse_mode: str = "") -> str:
             seg += "；如 %s" % g["eg"]
         seg += " → %s" % g["harm"]
         lines.append(seg)
-    for note in (errata.get("notes") or [])[:3]:
-        lines.append("  · 注记[%s]：%s" % (note.get("source", "?"), note.get("text", "")))
     if errata.get("unregistered"):
         keys = "、".join(str(u.get("key")) for u in errata["unregistered"][:5])
         lines.append("  · ⚠️ 存在未登记信号（无释义）：%s" % keys)

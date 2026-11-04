@@ -33,6 +33,17 @@ def test_lookup_unknown_returns_none():
     assert d._lookup("") is None
 
 
+def test_annotate_alias_is_note():
+    """用 `note` 而不是自造的 `anno`：与数据模型 errata_stats.notes 同词。
+
+    `anno` 不是英文词，`annotate` 在 Unix 生态里也没有通行缩写 —— 让人记一个
+    词典里没有的截断，等于每次都要回 `mhi help` 查一遍。
+    """
+    assert d._lookup("note") == ("annotate", "mhi_annotate")
+    assert d._lookup("annotate") == ("annotate", "mhi_annotate")
+    assert d._lookup("anno") is None
+
+
 def test_mapping_covers_every_cli_module():
     """完整性护栏：src/cli/mhi_*.py 与映射表必须一一对应。"""
     on_disk = {p.stem for p in (PROJECT_ROOT / "src" / "cli").glob("mhi_*.py")}

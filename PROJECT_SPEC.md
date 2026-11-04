@@ -364,14 +364,50 @@ SELECT COUNT(*) FROM documents_book WHERE tags LIKE ',%' OR tags LIKE '%,' OR ta
 
 **LLM 告知**：`read_book_chunk` 返回体里三个字段 ——
 `text_provenance`（引擎/档位/读数方式）、`text_errata`（计数 + 触发键的释义）、
-`text_trust`（渲染成一句话，含「引用本书内容时另找资料旁证」的指令）。
+`text_trust`（渲染成一段话，首行结论 + 注记 + 触发键释义 + 「另找资料旁证」的指令）。
 键的清单**不在 docstring 里穷举**（会漂移），由 `text_errata` 随 payload 自文档化。
 
-**外部注记入口**：`mhi annotate --from <manifest.jsonl|.csv>`（默认 dry-run）。
+**`text_trust` 的两种「没信号」必须分开说**（2026-11-04 定）：
+
+| errata_stats | 首行 |
+|---|---|
+| `{}` | 「无误差统计记录」——计数为 0 意思是**未记录**，不是无误差 |
+| 非空但一条判据都没触发 | 「已算误差统计但**未触发任何判据信号**，这不等于原文准确」+ 列出判据覆盖范围 |
+
+**为什么后者也要说**：判据是按语料定的（v1 全部为俄语/教会斯拉夫语语料设计，
+库里 `script_mix` 前 12 名清一色俄语书）。西语/拉丁/希腊语书上它天然全 0，
+而真正致命的误差（长音符、多调调符、IAST 下加点、U+FFFD）一个都不在判据里。
+静默 `return ""` 会让消费方把 0 读成「原文干净」—— 实测已在
+`Diccionario panhispánico`（10 页 FAQ 冒充 800 页词典）上复现。
+
+**外部注记入口**（两条路，殊途同归到 `errata_stats.notes`）：
+
+```bash
+# ① 导入时整批标（一次命令行 = 一批，与 --tags 同语义）
+mhi import <语料根>/*.zip --untrusted
+mhi import <语料根>/*.zip --untrusted "本批为扫描件，符号系统整体不可信"
+
+# ② 事后补标（不必写 manifest；短选项 -g/-p/-u/-y）
+mhi note -g 3f2a... -u
+mhi note -p "<语料根>/xxx.zip" -u "自定义文案" -y
+```
+
+`mhi note` = 规范名 `mhi annotate` 的别名（`note` 与数据模型 `errata_stats.notes`
+同词，不必再记第二套名字）；`-y` 即 `--apply`，与 `mhi rm` 的确认语义一致。
+
+`--untrusted` 是**可选值选项**：裸用取 `UNTRUSTED_DEFAULT_NOTE`（内置文案，
+刻意含「**补充联网搜索做旁证**」——没有这一句，模型会把「上下文说得通」当唯一判据，
+而幻觉的判据恰恰就是「说得通」）；带值则覆盖。
+
+批量 manifest 仍走 `mhi annotate --from <manifest.jsonl|.csv>`（默认 dry-run）。
 机械那部分判据由导入器自动算，但「每本书不一样」的东西（离线扫描、人工翻看、
 LLM 判断）代码里写不出规则，走 manifest 合并进同一列。匹配键按 robustness 降序
-试 `content_md5` → `source_path` → `title`，路径两侧归一（盘符 ↔ `/mnt/`、
+试 `guid` → `content_md5` → `source_path` → `title`，路径两侧归一（盘符 ↔ `/mnt/`、
 反斜杠、重复斜杠、NFC）；**多本命中一律拒绝，绝不静默取第一条**。
+
+注记的 `source` 一律带来源前缀（`import:--untrusted` / `annotate:--untrusted` /
+`audit_zip.py@日期`）—— 三种来源的可信度不同，混成一个 `manual` 就再也分不开了。
+渲染时**注记排在机械计数之前**：那是人的判断，埋在后面等于没写。
 
 **引擎约束（MariaDB 12.3.2 实测，别照搬 MySQL）**：
 `->` / `->>` / `JSON_VALUE(... RETURNING)` **都不支持** —— 取值用

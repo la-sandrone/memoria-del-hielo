@@ -140,6 +140,38 @@ mhi-tag <uuid> --list
 
 ---
 
+## 3.5 文本可信度注记（`--untrusted` / `mhi annotate`）
+
+机械判据（形近串写/断词/成串汉字/康熙部首/PUA）由导入器自动算；**算不出的**
+（「这批是扫描件，符号系统整体崩」）由人标 —— 落进 `errata_stats.notes`，
+MCP 每次返回正文时贴给模型。
+
+```bash
+# ① 导入时整批标（一次命令行 = 一批；裸用 --untrusted 取内置文案）
+mhi import <语料根>/*.zip --untrusted
+mhi import <语料根>/*.zip --untrusted "本批为扫描件，符号系统整体不可信"
+
+# ② 事后补标（对已入库的书；不必写 manifest）
+mhi note -g 3f2a... -u                # 最短形状，默认 dry-run
+mhi note -g 3f2a... -u -y             # 真写
+mhi note -p "<语料根>/xxx.zip" -u "自定义文案" -y
+mhi note -g A -g B -u -y              # 多本
+mhi note --guid 3f2a... --untrusted   # 长选项等价（短选项：-g/-p/-u/-y）
+
+# ③ 批量 manifest（离线审计产出；JSONL 或 CSV）
+mhi note --from manifest.jsonl                 # 默认 dry-run
+mhi note --from manifest.jsonl --apply
+```
+
+- `--untrusted` 裸用时用 `UNTRUSTED_DEFAULT_NOTE`，**刻意含「补充联网搜索做旁证」**
+  —— 没有这句，模型会把「上下文说得通」当唯一判据，而幻觉的判据恰恰就是「说得通」。
+- **默认 dry-run**：匹配错了会把注记挂到别的书上，且这种错误不报错、只静默污染。
+- `--guid/--path` 与 `--from` **互斥**；`--guid/--path` 必须配 `--untrusted`。
+- 注记的 `source` 记 `import:--untrusted` / `annotate:--untrusted`，与离线审计的
+  `audit_zip.py@日期` 区分开 —— 三种来源可信度不同，混成一个 `manual` 就分不开了。
+
+---
+
 ## 4. 独立清洗工具（不入库）
 
 ```bash
