@@ -83,20 +83,41 @@ def _missing_guids(requested, found):
 def _build_delete_statements(guids):
     """构造删除语句（不执行）。返回 [(sql, params), ...]。
 
-    顺序固定：先 page_footnotes（显式删，不依赖 fk_footnotes_book 的级联），后 documents_book
-    （chunks 由 fk_chunk_book 级联）。破坏性测试只断言本函数的 SQL 文本，
-    不真删数据；真正执行在 main() 的事务里。
+    ⚠️ 2026-11-07 修正：原来这里只删 page_footnotes 与 documents_book，指望
+    fk_chunk_book 级联删 chunks。但**活库上那个 FK 根本不存在**
+    （information_schema 里只有 bucket_config 与 page_footnotes 两条外键），
+    所以级联从未生效 —— 实测已攒下 3,109 行孤儿 chunk（book_guid 指向已删除的书）。
+    垂直分表后 chunks 还多了两张侧表（fts / vec，主键 chunk_id、无 FK），
+    级联更不可能覆盖。故这里改成**显式按依赖顺序删**，不依赖任何级联：
+      侧表 → 主 chunk → 脚注 → 书目
+    破坏性测试只断言本函数的 SQL 文本，不真删数据；真正执行在 main() 的事务里。
     """
     placeholders = ",".join("?" for _ in guids)
-    params = tuple(guids)
+    params = tuple(guids)          # 五条语句的占位符个数都等于 len(guids)
+    chunk_scope = (
+        "SELECT chunk_id FROM documents_book_chunk WHERE book_guid IN (%s)"
+        % placeholders
+    )
     return [
         (
-            "DELETE FROM page_footnotes WHERE book_guid IN (%s)" % placeholders,
+            "DELETE FROM documents_book_chunk_fts WHERE chunk_id IN (%s)" % chunk_scope,
             params,
         ),
         (
-            "DELETE FROM documents_book WHERE guid IN (%s)" % placeholders,
+            "DELETE FROM documents_book_chunk_vec WHERE chunk_id IN (%s)" % chunk_scope,
             params,
+        ),
+        (
+            "DELETE FROM documents_book_chunk WHERE book_guid IN (%s)" % placeholders,
+            tuple(guids),
+        ),
+        (
+            "DELETE FROM page_footnotes WHERE book_guid IN (%s)" % placeholders,
+            tuple(guids),
+        ),
+        (
+            "DELETE FROM documents_book WHERE guid IN (%s)" % placeholders,
+            tuple(guids),
         ),
     ]
 

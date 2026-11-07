@@ -62,7 +62,7 @@
 | Database | `memoria_del_hielo` |
 | 用户 | 专用用户，`'%'` 连接，仅对该库有权限 |
 | 字符集 | `utf8mb4`，collation `utf8mb4_uca1400_ai_ci` |
-| 全文搜索 | InnoDB FULLTEXT + jieba 分词（如 MariaDB 无 jieba 插件则用 `WITH PARSER ngram`，token_size=2） |
+| 全文搜索 | InnoDB FULLTEXT + **应用层 unigram+bigram**（`tokenize_cjk_ub_v2`，不用 jieba、不依赖词典；查询侧 `build_cjk_query_v2` + **NATURAL LANGUAGE MODE**） |
 | VECTOR | `VECTOR(1024)`，HNSW 索引 `M=16 DISTANCE=cosine` |
 | 密码 | 从环境变量 `MHI_DB_PASSWORD` 读取 |
 
@@ -229,13 +229,35 @@ CREATE TABLE documents_book_chunk (
     grapheme_len   INT UNSIGNED NOT NULL DEFAULT 0,  -- 字素簇数（统计口径，无对应偏移）
     has_pua        TINYINT(1) NOT NULL DEFAULT 0,    -- 区间有 PUA → 检索回查全文表取原文
     content        MEDIUMTEXT NOT NULL,              -- 净化版（PUA → U+FFFD 等长替换）
-    content_tokenized MEDIUMTEXT NOT NULL,
-    embedding      VECTOR(1024) NOT NULL,
     created_at     DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FULLTEXT idx_ft_chunk (content_tokenized) WITH PARSER ngram,
-    VECTOR INDEX idx_vec_chunk (embedding) M=16 DISTANCE=cosine
+    UNIQUE KEY uq_book_seq (book_guid, chunk_seq),
+    CONSTRAINT fk_chunk_book FOREIGN KEY (book_guid)
+        REFERENCES documents_book(guid) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_uca1400_ai_ci;
+
+-- 2026-11-07 垂直分表：tokenized 与向量各在各的侧表（侧表**不带外键**）
+CREATE TABLE documents_book_chunk_fts (
+    chunk_id          BIGINT UNSIGNED NOT NULL PRIMARY KEY,
+    content_tokenized MEDIUMTEXT NOT NULL,   -- v2 分词（汉字段 unigram+bigram，非汉整词）
+    FULLTEXT idx_ft_tokenized (content_tokenized)
+);
+CREATE TABLE documents_book_chunk_vec (
+    chunk_id  BIGINT UNSIGNED NOT NULL PRIMARY KEY,
+    embedding VECTOR(1024) NOT NULL,
+    VECTOR INDEX idx_vec_chunk (embedding) M=16 DISTANCE=cosine
+);
 ```
+
+**为什么要垂直分表（2026-11-07，实测）**：原单表 654,315 行，`information_schema` 报 13 GB
+而**真实占盘 25 GB** —— InnoDB 给两个 FULLTEXT 各建了一代影子文件（合计约 8.1 GB），
+另有 `#i#04` 段 1.85 GB。行宽约 10.6 KB（content 3.3 + tokenized 3.2 + 向量 4.0）⟹
+一个 16 KB 页只装约 1.5 行，**向量精确扫描读的是整行**。拆开后各表各管一列，
+扫描密度回来；`content` 上的 FULLTEXT 退役（`content_tokenized` 是它的投影）。
+迁移器 `tools/split_memoria.py`（可急停/可续跑），手册 `docs/检索-垂直分表迁移.md`。
+
+**侧表为什么不带外键**：外键会让 `RENAME` 切换被拦住。代价是删书必须显式删三张表 ——
+`mhi_remove_book` 已改成「侧表 → 主 chunk → 脚注 → 书目」的显式顺序
+（活库历史上正因「以为有级联、其实没有」攒下过 3,109 行孤儿 chunk）。
 
 **切块政策 v2**：
 

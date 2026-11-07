@@ -2,6 +2,79 @@
 
 格式：按日期倒序。每条记「**为什么**」而不只是「改了什么」。
 
+---
+
+## 2026-11-07 — 检索：垂直分表 + 分词 v2 + NATURAL LANGUAGE MODE
+
+### 动机
+
+「搜不出来」不是一句话，是七个可测机制。这次在**本项目自己的库**上治掉了其中四个，
+依据是 melquiades 那场同源工作（`dsh_message` 重建与垂直分表）的结论 + 本项目实测。
+
+**一、查询侧一直是 AND 布尔。** `build_cjk_boolean` 把查询的每个 bigram 用 `+` 串成 AND，
+要求**同一条 chunk 同时含有全部分词**。拿 `docs/真实检索查询分布案例.md` 那 190 条真实
+查询的形态直接打本项目：
+
+| 查询 | BOOLEAN AND | NL + bigram |
+|---|---|---|
+| 卡尔萨根 魔鬼出没的世界 科学 迷信 伪科学 | **0 命中**（5 ms） | 41,387 命中，top-1 对（3.2 s） |
+| 克尔度规 零测地线 Carter 常数 分离变量 | **0 命中**（3 ms） | 17,549 命中，top-1 对（1.1 s） |
+| 较差自转 罗斯贝数 行星 流体 对流 泰勒普劳德曼 纬向流 | **0 命中**（5 ms） | 12,828 命中，top-1 对（0.6 s） |
+| helium 3D excitation electron impact cross section | **0 命中**（8 ms） | 14,260 命中 |
+
+「快」是因为它什么都没查。文档里那 17 条空手案例就是这个形态。
+
+**二、分词吞掉汉字。** 正则 `([汉]+)|(\w+)` 里 `\w` **包含汉字**，遇到 "JDBC接口"
+这种拉丁紧邻汉字的串，`\w+` 把整串吃掉 —— 那些汉字既无 unigram 也无 bigram，
+在索引里等于不存在，且**不报任何错**。723 行分层抽样：**142 行 = 19.6%** 受影响。
+（melquiades 那边同一条正则、同一个病：39,409 行 = 19.1%。）
+
+**三、占盘 25 GB，而信息架构报 13 GB。** InnoDB 给两个 FULLTEXT 各建了一代影子文件
+（合计 8.1 GB），而 `content_tokenized` 本来就是 `content` 的投影。行宽 10.6 KB
+（content 3.3 + tokenized 3.2 + 向量 4.0），一个 16 KB 页只装 1.5 行 —— 向量精确扫描
+读的是整行。
+
+**四、某条路抛异常 = 静默空手。** 两条路都是 `except → warnings.warn → return []`，
+调用方看到的现象和「库里没有」完全一样。
+
+### 改法
+
+| 面 | 改动 |
+|---|---|
+| 分词 | 新增 `iter_chunks` / `tokenize_cjk_ub_v2` / `build_cjk_query_v2`：**先按汉字/非汉字切段**，汉字段永远拿 unigram+bigram，不给 `\w+` 吞掉的机会。查询侧只给 bigram（unigram 会拉平 NL 打分）、过停词表、不带操作符 |
+| 查询 | 全文路改 `NATURAL LANGUAGE MODE`；CJK 与非 CJK 都打 `content_tokenized`（拉丁词在里面是整词）⟹ `content` 的 FULLTEXT 退役 |
+| 兜底 | 新增 LIKE 子串路（权重 0.05），**只在全文与向量都空时**触发；它救的是分词覆盖不到的词 |
+| 降解 | `search_meta` 新增 `degraded`（哪条路挂了）与 `salvaged`（兜底救回几条）；MCP `search_docs` docstring 同步 |
+| 结构 | 垂直分表三表：主表（元数据+content）/ `_fts`（tokenized+FULLTEXT）/ `_vec`（向量+HNSW），侧表不带外键 |
+| 缓存 | `embedding_cache.vector_json` MEDIUMTEXT → `embedding` VECTOR(1024)：968 MB → 约 117 MB |
+| 删书 | `mhi_remove_book` 改成显式删三张表（侧表 → 主 chunk → 脚注 → 书目） |
+
+### 顺手挖出的既存缺陷
+
+**`mhi_remove_book` 依赖的 `ON DELETE CASCADE` 从来没生效过。**
+`scripts/init_db.sql` 声明了 `fk_chunk_book`，但活库 `information_schema` 里只有
+`bucket_config` 与 `page_footnotes` 两条外键 —— 删书一直在留孤儿 chunk，实测已攒
+**3,109 行**（全部指向一本已删除的书）。这不是分表引入的，是分表时「FK 建不上」
+把它照出来的。
+
+### 工具与文档
+
+- `tools/split_memoria.py` — 离线迁移器：preflight/create/prune/fill/index/cache/verify/switch，
+  可急停（子进程 + KILL 连接）、可续跑（水位线同事务）、带 verify 闸门
+- `scripts/migrate_009_split_chunk.sql` — 「实际做了什么」的镜像
+- `docs/检索-垂直分表迁移.md` — 手册（含三个实测踩出来的坑）
+- `tests/test_tokenizer_v2.py` — 12 类语料 + 「查询侧 token 必须都在写入侧索引里」不变式
+
+### 顺手改的一条默认值
+
+`mineru_batch.py --split-limit` 默认 **400 → 0（不拆）**。MinerU V4 实测内存表现可接受，
+不需要靠拆卷压内存；想要旧行为就显式给 `--split-limit 400`。
+
+### 已知代价
+
+NL MODE 比 BOOLEAN 慢一两个数量级（0.05–3.2 s vs 5–13 ms），但它**有结果**；
+LIKE 兜底在全表上约 16 秒，故只在空结果时跑。
+
 > **注**：`PROJECT_SPEC.md` / `scripts/init_db.sql` / `src/cli/mhi_dispatch.py` /
 > `tests/test_text_trust_note.py` 的未提交改动属于更早的工作，不在本文件记录范围。
 

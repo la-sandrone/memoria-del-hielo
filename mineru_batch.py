@@ -36,7 +36,8 @@ MinerU 批量处理脚本 v6.5 -- bash 生成器架构（MinerU v3 / v4 双适�
     --lang ch                     语言（缺省不指定。v3 走 --lang；v4 无 --lang 选项，改走 MINERU_LANG 环境变量）
     --no-skip                     强制重处理已有结果的书
     -r                            递归扫描子目录
-    --split-limit N               PDF 页数超限自动拆卷（默认 400；=0 不拆；pipeline 后端不拆）
+    --split-limit N               PDF 页数超限自动拆卷（**默认 0 = 不拆**；正数才拆；
+                                  pipeline 后端不拆）
     --dry-run                     只打印生成的 bash 脚本，不执行（拆卷也只预演、不写盘）
     --extra-args ...              透传给 mineru / mineru-kit CLI 的额外参数（放最后）
     --max-path N                  Win32 路径长度上限（默认 260；=0 不检查长度，只查名字合法性）
@@ -1630,8 +1631,8 @@ def main():
                    help="递归扫描子目录")
     p.add_argument("--no-skip", action="store_true",
                    help="强制重处理已有结果的书")
-    p.add_argument("--split-limit", type=int, default=400,
-                   help="PDF 页数超限自动拆卷（默认400；=0不拆；pipeline不拆）")
+    p.add_argument("--split-limit", type=int, default=0,
+                   help="PDF 页数超限自动拆卷（**默认 0 = 不拆**；正数才拆；pipeline 不拆）")
     p.add_argument("--dry-run", action="store_true",
                    help="只打印生成的 bash 脚本，不执行（拆卷也只预演、不写盘）")
     p.add_argument("--extra-args", nargs=argparse.REMAINDER,
@@ -1883,6 +1884,9 @@ def main():
     pdfs = [r.path for r in live if r.path.suffix.lower() == ".pdf"]
     dropped = 0
     # pipeline 后端不支持拆卷（v3 专属约束；v4 无 backend 概念，永远可拆）
+    #
+    # ★ 2026-11-07 起 --split-limit 默认 0（不拆）：MinerU V4 实测内存表现可接受，
+    #   不需要靠拆卷压内存。想要旧行为就显式给 --split-limit 400。
     if a.split_limit > 0 and "pipeline" not in backend and pdfs:
         pdfs, dropped = split_oversized(pdfs, a.split_limit,
                                         {r.path: r.stem for r in live},

@@ -14,8 +14,10 @@
 
 from __future__ import annotations
 
+import array
 import hashlib
 import json
+import warnings
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +27,35 @@ from .config import get_config
 from .db import get_db, get_last_rowcount
 from .http_client import local_client
 from .sqlbatch import SqlBatcher
+
+
+def _pack_vector(vector: list[float]) -> bytes:
+    """float32 小端字节（与 MariaDB VECTOR 列的存储形态一致）。"""
+    return array.array("f", vector).tobytes()
+
+
+def _unpack_vector(raw: Any) -> list[float] | None:
+    """VECTOR 列读回来是 bytes（4 字节/维，小端）；坏数据/未知形态返回 None。"""
+    if isinstance(raw, (bytes, bytearray)):
+        if not raw or len(raw) % 4:
+            return None
+        return list(array.array("f", bytes(raw)))
+    return None
+
+
+_cache_shape_warned = False
+
+
+def _warn_cache_shape(exc: Exception) -> None:
+    """缓存表结构与代码不一致时只告警一次，绝不让检索挂掉（缓存不是必需品）。"""
+    global _cache_shape_warned
+    if _cache_shape_warned:
+        return
+    _cache_shape_warned = True
+    warnings.warn(
+        f"embedding_cache 结构与代码不一致，本次跳过缓存：{exc}；"
+        "先跑 python3 tools/split_memoria.py cache（JSON → VECTOR 二进制列）"
+    )
 
 
 class EmbeddingError(RuntimeError):
@@ -246,17 +277,20 @@ class EmbeddingService:
         while pending:
             chunk, pending = pending[:300], pending[300:]
             placeholders = ",".join(["?"] * len(chunk))
-            rows = get_db().execute_sql(
-                "SELECT text_hash, vector_json FROM embedding_cache "
-                f"WHERE model = ? AND text_hash IN ({placeholders}) "
-                "AND (expires_at IS NULL OR expires_at > NOW())",
-                (self.model, *chunk),
-            )
+            try:
+                rows = get_db().execute_sql(
+                    "SELECT text_hash, embedding FROM embedding_cache "
+                    f"WHERE model = ? AND text_hash IN ({placeholders}) "
+                    "AND (expires_at IS NULL OR expires_at > NOW())",
+                    (self.model, *chunk),
+                )
+            except Exception as exc:
+                _warn_cache_shape(exc)
+                return out
             for row in rows:
-                try:
-                    out[row["text_hash"]] = list(json.loads(row["vector_json"]))
-                except (json.JSONDecodeError, TypeError, ValueError):
-                    continue  # 坏数据当未命中
+                vec = _unpack_vector(row["embedding"])
+                if vec is not None:
+                    out[row["text_hash"]] = vec
         return out
 
     def _cache_get(self, text: str) -> list[float] | None:
@@ -266,19 +300,19 @@ class EmbeddingService:
         expires_at < NOW() = 已过期（视为未命中，下次写入覆盖）。
         """
         text_hash = self._text_md5(text)
-        rows = get_db().execute_sql(
-            "SELECT vector_json FROM embedding_cache "
-            "WHERE text_hash = ? AND model = ? "
-            "AND (expires_at IS NULL OR expires_at > NOW())",
-            (text_hash, self.model),
-        )
+        try:
+            rows = get_db().execute_sql(
+                "SELECT embedding FROM embedding_cache "
+                "WHERE text_hash = ? AND model = ? "
+                "AND (expires_at IS NULL OR expires_at > NOW())",
+                (text_hash, self.model),
+            )
+        except Exception as exc:
+            _warn_cache_shape(exc)
+            return None
         if not rows:
             return None
-        try:
-            return list(json.loads(rows[0]["vector_json"]))
-        except (json.JSONDecodeError, TypeError, ValueError):
-            # 坏数据不阻断主线流程——下次写入覆盖
-            return None
+        return _unpack_vector(rows[0]["embedding"])
 
     def _get_cache_batcher(self) -> SqlBatcher:
         """惰性创建缓存攒批器（TTL 决定 expires_at 的写法，故按 tt l 建一次）。"""
@@ -296,7 +330,7 @@ class EmbeddingService:
                 row_template=tmpl,
                 tail=(
                     "ON DUPLICATE KEY UPDATE "
-                    "vector_json = VALUES(vector_json), "
+                    "embedding = VALUES(embedding), "
                     "expires_at = VALUES(expires_at)"
                 ),
             )
@@ -311,8 +345,9 @@ class EmbeddingService:
     def _cache_set(self, text: str, vector: list[float]) -> None:
         """写缓存：只入队，由 flush_cache()/with 块统一多条一语句发出。"""
         text_hash = self._text_md5(text)
-        payload = json.dumps(vector, ensure_ascii=False)
-        self._get_cache_batcher().add((text_hash, self.model, payload))
+        # VECTOR(1024) 二进制列：float32 小端 4096 字节，不再存约 22 KB 的 JSON
+        # （实测 embedding_cache 968 MB → 约 117 MB）。驱动接受 bytes 直写，已实测。
+        self._get_cache_batcher().add((text_hash, self.model, _pack_vector(vector)))
 
     # ------------------------------------------------------------------
     # 内部

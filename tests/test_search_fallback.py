@@ -23,16 +23,31 @@ class _StubEngine(SearchEngine):
         self.vec_hits = vec_hits
 
     def _book_search(self, query, bucket, tags, limit, fulltext_only, vector_only,
-                     is_cjk, ft_w, vec_w):
+                     ft_w, vec_w, degraded):
+        # 返回 (结果, 子串兜底命中数) —— 2026-11-07 起带上 degraded/salvaged
         out = []
         if not vector_only:
             out += [dict(h) for h in self.ft_hits]
         if not fulltext_only:
             out += [dict(h) for h in self.vec_hits]
-        return out
+        return out, {"salvaged": 0, "retried_unpruned": False}
 
     def _other_search(self, *args, **kwargs):
         return []
+
+
+def test_final_sort_survives_missing_rerank():
+    """rerank 没跑成（或服务挂了）时不许崩，要退回融合分。
+
+    历史 bug：_book_search 在 rerank 失败时把 score_rerank 显式设成 None，
+    而排序键写的是 x.get("score_rerank", x["score"]) —— 键存在且值为 None 时
+    get 返回 None，-None 抛 TypeError。于是 rerank 一挂，检索从「降级」变「崩溃」。
+    """
+    from src.core.search import _final_rank_key
+
+    assert _final_rank_key({"score_rerank": None, "score": 0.5}) == -0.5
+    assert _final_rank_key({"score_rerank": 0.9, "score": 0.1}) == -0.9
+    assert _final_rank_key({}) == 0.0
 
 
 def test_pure_helper_decides_fallback():
@@ -65,7 +80,12 @@ def test_no_fallback_when_hit():
     eng = _StubEngine(ft_hits=FT, vec_hits=VEC)
     assert eng.search("q", fulltext_only=True, with_meta=True)["search_meta"]["fallback"] is None
     hy = eng.search("q", with_meta=True)
-    assert hy["search_meta"] == {"mode": "hybrid", "returned": 2, "fallback": None}
+    meta = hy["search_meta"]
+    assert meta["mode"] == "hybrid" and meta["returned"] == 2 and meta["fallback"] is None
+    # 2026-11-07 新增：降级/兜底/剪枝都必须对调用方可见
+    assert meta["degraded"] == [] and meta["salvaged"] == 0
+    assert meta["retried_unpruned"] is False
+    assert meta["query_terms"]["kept"] and isinstance(meta["query_terms"]["pruned"], list)
 
 
 def test_empty_hybrid_is_the_real_no_hit_signal():

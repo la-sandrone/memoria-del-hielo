@@ -47,7 +47,7 @@ def search_docs(
     fulltext_only: bool = False,
     vector_only: bool = False,
 ) -> str:
-    """搜索知识库内容（chunk 级双路：全文 + 向量）。典型耗时 0.3–1.5 秒，可直接调用。
+    """搜索知识库内容（chunk 级双路：全文 + 向量）。典型耗时 **2–7 秒**（实测：全文路 NL 约 3 秒 + 向量路精确扫描约 1.7 秒；2026-11-07 从 BOOLEAN 换 NL 后变慢，但换来的是真能命中）。
 
     ⚠️ 文本可信度：本库正文来自 PDF 的 md 产出，**文本层不保证等于原文**（字体映射
     可以撒谎：生僻文种可能被读成看着正常的 ASCII；实测某本书 27% 的页面上有这种片段）。
@@ -58,24 +58,35 @@ def search_docs(
     不适合「找这一条 / 判重 / 验证是否已入库」这类精确查找**——那会撞上漏检。
     精确匹配请用 `fulltext_only=True`。
 
-    ⚠️ **关于俄文 / 希腊文 / 带变音拉丁文**：**非 CJK 查询走 `content` 列的 FULLTEXT
-    （MariaDB 默认空格分词），不依赖 tokenized，正常工作**（实测俄文可命中）。
-    `content_tokenized` 里这些文字为空，只影响「中文查询命中它们」这类混合场景——
-    而那类场景本来就该走**向量路**（bge-m3 多语言共享语义空间，实测中文查询直接
-    命中俄文书的对应章节）。
+    **查询是怎么被解释的（2026-11-07 起，与写入口径同源）**：汉字切成 bigram（「绘图工具」
+    → 绘图/图工/工具，**不用 jieba**、不依赖词典），非汉字取整词，过一张停词表；
+    然后用 **NATURAL LANGUAGE MODE** 打分。**不要自己拼 `+` / `*` 布尔语法**——
+    那是 BOOLEAN MODE 的，这里不接受。
+    为什么改：BOOLEAN MODE 会把全部分词用 AND 串起来（要求一条 chunk 同时含有它们），
+    长查询必然 0 命中。实测本项目真实查询 5 条里 4 条 BOOLEAN 0 命中，
+    换 NL 后 6,000–41,000 命中、top-1 命中对的书。
+
+    ⚠️ **关于俄文 / 希腊文 / 带变音拉丁文**：这些文字在 tokenized 里是**整词**（字母数字串整体保留），
+    所以**非 CJK 查询照常命中**（实测俄文可命中），只是不再走 `content` 列——
+    那个 FULLTEXT 索引已退役（它是 content_tokenized 的重复投影）。
     **残留问题**：希腊文/拉丁文的**屈折变化**（`Πλάτων` vs `Πλάτωνος`）会让精确词匹配
-    失败，需要词形还原（lemmatization）——那是另一件工程，与 tokenized 无关。
+    失败，需要词形还原（lemmatization）——那是另一件工程。这类场景走向量路。
 
     book 类别返回 chunk 级结果（含 book_title / heading_path / chunk_seq /
     book_hit_count），命中后用 read_book_chunk 钻取原文；
     chat/onenote 返回整档结果。自动合并去重。
 
-    **返回结构**：`{"results": [...], "search_meta": {"mode", "returned", "fallback"}}`
-      · `search_meta.fallback` **非 null 表示发生了自动回退**：你传了 fulltext_only 或
-        vector_only，而那一路没命中，系统自动补了另一路——形如
+    **返回结构**：`{"results": [...], "search_meta": {"mode", "returned", "fallback", "degraded", "salvaged"}}`
+      · `fallback` **非 null = 发生了自动回退**（你传了单路参数而那一路没命中）——形如
         `{"to": "vector_only", "reason": "全文路无命中", "returned_after": 12}`。
-        看到它就知道：**不能据此判断"库里没有"**，只是原来的搜索方式打不中。
-      · `results` 为空且 fallback 为 null → 双路都无命中（这才是"库里大概率没有"的信号）。
+        看到它就知道：**不能据此判断"库里没有"**。
+      · `degraded` **非空 = 有一条路抛异常退出了**（全文 / 向量 / 嵌入服务），形如
+        `[{"route": "vector", "reason": "..."}]`。这时 results 可能是残的，
+        **不要当作"库里没有"**。
+      · `salvaged` **> 0 = 全文与向量都没打中，是子串兜底（LIKE）救回来的**条数。
+        出现它说明查询里可能有分词覆盖不到的词（混合文字、生僻专名），
+        相关性会明显弱于正常路径，值得换词重查。
+      · 三者都干净且 `results` 为空 → 双路 + 兜底都没命中（这才是"库里大概率没有"）。
 
     找"书"（而不是找段落）请用 find_books；按 bucket/tag 列表请用 list_books。
 
@@ -85,7 +96,7 @@ def search_docs(
         bucket: 限定桶（可用 list_buckets 查看）。
         tags: 限定 tag（可用 list_tags 查看）；OMNIA = 搜全部数据（与不传/空串同义）。
         limit: 返回条数（默认 10）。
-        fulltext_only: 仅全文搜索（unigram+bigram + BOOLEAN MODE；中文单字/任意子串均可命中，
+        fulltext_only: 仅全文搜索（unigram+bigram 索引 + NATURAL LANGUAGE MODE；
                        无命中时会自动补向量路并标注 fallback——细节型查询建议直接用默认双路）。
         vector_only: 仅向量搜索（无命中时会自动补全文路并标注 fallback）。
     """

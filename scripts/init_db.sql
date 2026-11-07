@@ -90,18 +90,45 @@ CREATE TABLE IF NOT EXISTS documents_book_chunk (
         -- 切块政策 v2：三偏移四长度 + PUA 标志（字素簇对齐 / 可见字符口径 / 精确字节偏移）。
         -- 检索侧按 has_pua 决定是否走 SUBSTRING 净化路径。
     content           MEDIUMTEXT NOT NULL,
-    content_tokenized MEDIUMTEXT NOT NULL
-        COMMENT '应用层 jieba 分词结果，用于 CJK FULLTEXT 搜索',
-    embedding         VECTOR(1024) NOT NULL,
     created_at        DATETIME DEFAULT CURRENT_TIMESTAMP,
     UNIQUE KEY uq_book_seq (book_guid, chunk_seq),
-    FULLTEXT idx_ft_chunk_content (content),
-    FULLTEXT idx_ft_chunk_tokenized (content_tokenized),
-    VECTOR INDEX idx_vec_chunk (embedding) M=16 DISTANCE=cosine,
     CONSTRAINT fk_chunk_book
         FOREIGN KEY (book_guid) REFERENCES documents_book(guid)
         ON DELETE CASCADE
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_uca1400_ai_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_uca1400_ai_ci
+  COMMENT='chunk 主表：只留元数据 + content（垂直分表 2026-11-07）';
+
+-- ══════════════════════════════════════════════════════════════════════
+-- 垂直分表（2026-11-07）：tokenized 与向量搬到侧表
+-- ══════════════════════════════════════════════════════════════════════
+-- 为什么拆：原表真实占盘 25 GB / 654,315 行，其中
+--   · InnoDB 给两个 FULLTEXT 建了约 8.1 GB 影子文件（各一份 token 副本）
+--   · 行宽约 10.6 KB（content 3.3 + tokenized 3.2 + 向量 4.0），
+--     一个 16 KB 页只装约 1.5 行 ⟹ 向量精确扫描读的是整行而不是那 4 KB
+-- 拆完：各表各管一列，扫描密度回来；content 上的 FULLTEXT 退役
+--   （content_tokenized 是它的投影，查询侧统一打 tokenized）。
+--
+-- ⚠️ 侧表**不带外键**（只挂 chunk_id）。理由：外键会让 RENAME 切换被拦住；
+--    代价是删书要显式删三张表 —— 见 src/cli/mhi_remove_book.py
+--    （活库历史上正因「以为有级联、其实没有」攒下过 3,109 行孤儿）。
+--
+-- 迁移工具：python3 tools/split_memoria.py（可急停、可续跑、人工运行）
+CREATE TABLE IF NOT EXISTS documents_book_chunk_fts (
+    chunk_id          BIGINT UNSIGNED NOT NULL,
+    content_tokenized MEDIUMTEXT NOT NULL
+        COMMENT 'v2 分词：汉字段 unigram+bigram，非汉字段整词（tokenize_cjk_ub_v2）',
+    PRIMARY KEY (chunk_id),
+    FULLTEXT idx_ft_tokenized (content_tokenized)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_uca1400_ai_ci
+  COMMENT='FULLTEXT 侧表（查询走 NATURAL LANGUAGE MODE）';
+
+CREATE TABLE IF NOT EXISTS documents_book_chunk_vec (
+    chunk_id  BIGINT UNSIGNED NOT NULL,
+    embedding VECTOR(1024) NOT NULL,
+    PRIMARY KEY (chunk_id),
+    VECTOR INDEX idx_vec_chunk (embedding) M=16 DISTANCE=cosine
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_uca1400_ai_ci
+  COMMENT='向量侧表（一行 4 KB，扫描密度约为原主表的 2.6 倍）';
 
 -- AI 对话
 CREATE TABLE IF NOT EXISTS documents_chat (
@@ -186,7 +213,8 @@ VALUES
 CREATE TABLE IF NOT EXISTS embedding_cache (
     text_hash   CHAR(32) NOT NULL COMMENT 'md5(utf8 text)',
     model       VARCHAR(128) NOT NULL COMMENT '模型标识（含 local:/remote: 前缀）',
-    vector_json MEDIUMTEXT NOT NULL COMMENT 'JSON float 数组',
+    embedding   VECTOR(1024) NOT NULL
+        COMMENT '二进制 float32×1024 = 4096 字节/行（原先存 JSON 文本约 22 KB/行）',
     created_at  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     expires_at  DATETIME DEFAULT NULL COMMENT 'NULL = 永不过期',
     PRIMARY KEY (text_hash, model),

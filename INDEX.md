@@ -5,9 +5,17 @@
    关键词: 架构, 数据库, API, 清洗规则, 图片管线
 2. docs/OPERATIONS.md — 操作手册与检查单（前置依赖→建库→导入→搜索→MCP→冒烟测试）
    关键词: 操作, 检查单, 冒烟测试, 常见问题
+   ★ docs/备份与恢复.md — 全库备份（mariadb-dump + zstd）、恢复、**验证备份的四步**；
+     VECTOR 列的十六进制编码与位级往返实测。备份放 D: 盘根目录
+   ★ docs/检索-垂直分表迁移.md — 2026-11-07 那次三表迁移的手册（含三个实测踩出来的坑、
+     耗时曲线、磁盘预算）；待办见 docs/待办-检索下一版.md
 3. config.toml — 项目配置（数据库连接、嵌入端点、OCR、Everything、路径）
    关键词: 配置, MariaDB, BGE, PaddleOCR
 4. scripts/init_db.sql — 数据库建表脚本（fresh install 与迁移后 schema 一致）
+   ★ 2026-11-07 起 chunk 层是三表：documents_book_chunk（元数据+content）/
+     documents_book_chunk_fts（tokenized+FULLTEXT）/ documents_book_chunk_vec（向量+HNSW）；
+     迁移器 tools/split_memoria.py，手册 docs/检索-垂直分表迁移.md，
+     实际做了什么见 scripts/migrate_009_split_chunk.sql
    - documents_book（书目卡片：source_path_hash 幂等锚点 + 书目向量 + 原文档案；书级全文索引已退役）
    - documents_book_chunk（书桶检索主战场：双 FULLTEXT + VECTOR HNSW + FK CASCADE）
    - chat/onenote 主表 + images + 配置表；存量库走 scripts/migrate_001_chunk.sql
@@ -23,7 +31,12 @@
    · sqlbatch.py — 攒批装置：N 行一条多值 SQL、一条连接；双上限（行数 + 语句字节）、
      探测服务端包限并按 75% 压顶、撞 1153 砍半拆批、瞬时错误退避重试
    · embedding.py — server_bge.py HTTP 客户端（嵌入 + 重排 + JSONL 缓存 + embed_batch 批量嵌入）
-   · tokenizer.py — 共享分词工具（has_cjk + tokenize + tokenize_query）
+   · tokenizer.py — 共享分词工具（has_cjk + tokenize + tokenize_query 为旧口径）
+     ★ 检索口径权威实现（2026-11-07 起）：iter_chunks（按汉字/非汉字切段，唯一切分点）+
+     tokenize_cjk_ub_v2（写入侧：汉字段 unigram+bigram、非汉字段整词）+
+     build_cjk_query_v2（查询侧：只 bigram、过停词表、不带布尔操作符）。
+     为什么换：v1 正则 `([汉]+)|(\w+)` 的 `\w` 含汉字，会把「拉丁紧邻汉字」的整串
+     吞成一个 token，那些汉字在索引里等于不存在（抽样 19.6% 的行受影响，症状是 0 命中且不报错）
    · unicode_utils.py — Unicode 数字面量工具（唯一权威实现）：可见码点口径、
      PUA→U+FFFD 等长净化、UAX#29 字素簇边界（regex \X）、可见/字节前缀和；
      将来换 PyICU 只改此文件
@@ -36,8 +49,13 @@
    · zip_input.py — MinerU `--format zip` 的**物化器**：解成普通目录（内容寻址，
      <项目根>/cache/mineru_unzip/<zip 内容 md5>/），只解正文+两侧车+images/，
      跳过 model_output.json；zip-slip 与总量上限**整包拒绝**（不清洗后继续）
-   · search.py — v2 双路搜索：book 走 documents_book_chunk（chunk 级 + 书级聚合 +
-     每书限流），has_pua 回查全文表；chat/onenote 整档粒度；CJK 向量0.8/全文0.2 不变。
+   · search.py — v3 三路搜索（2026-11-07 垂直分表后）：book 走三张表
+     （documents_book_chunk 元数据+content / _fts 带 FULLTEXT / _vec 带 HNSW），
+     chunk 级 + 书级聚合 + 每书限流；has_pua 回查全文表；chat/onenote 整档粒度；
+     CJK 向量0.8/全文0.2 不变。
+     ★ 全文路一律 NATURAL LANGUAGE MODE（BOOLEAN 会把全部 bigram AND 起来，真实查询
+       5 条里 4 条 0 命中）；★ 另有 LIKE 子串兜底（权重 0.05，**只在其它路全空时**跑）；
+     ★ 降级不静默：search_meta 带 degraded（哪条路挂了）/ salvaged（兜底救回几条）。
      另含 find_books()：书级语义检索（书名+目录近邻，只排序不判存在性）；
      两处向量 SQL 都遵守「派生表解析一次 + 排序/payload 分两段」形状（见该文件注释）
    · tag_manager.py — Tag 增删改查（逗号分割 tags 字段；写入前逐元素校验）+ audit_tags 全库体检

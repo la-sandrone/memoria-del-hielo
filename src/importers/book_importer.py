@@ -53,7 +53,7 @@ from ..core.mineru_postprocess import MineruPostprocessor, get_mineru_postproces
 from ..core.text_errata import count_errata, merge_errata
 from ..core.mineru_schema import FORM_DIR, FORM_FLAT, FORM_FULL
 from ..core.tags import validate_single_tag, validate_write_tags
-from ..core.tokenizer import tokenize_cjk_ub
+from ..core.tokenizer import tokenize_cjk_ub_v2
 from ..core.zip_input import (
     REQUIRED_MEMBER,
     ZipInputError,
@@ -489,10 +489,8 @@ class BookImporter:
                 c.grapheme_len,
                 int(c.has_pua),
                 c.content,
-                tokenize_cjk_ub(c.content),
-                _emb_bytes(chunk_vecs[i]),
             )
-            for i, c in enumerate(chunks)
+            for c in chunks
         ]
 
         # 6. 入库（单事务：书 + 全部 chunk；chunk 分批插入——
@@ -508,11 +506,45 @@ class BookImporter:
                                 """INSERT INTO documents_book_chunk
                                    (book_guid, chunk_seq, heading_path, char_start, char_len,
                                     visible_start, visible_len, byte_start, byte_len,
-                                    grapheme_len, has_pua,
-                                    content, content_tokenized, embedding)
-                                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                    grapheme_len, has_pua, content)
+                                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                                 chunk_rows[i : i + 200],
                             )
+
+                        # 垂直分表（2026-11-07）：content_tokenized 与 embedding 各在
+                        # 自己的侧表（documents_book_chunk_fts / _vec），主键都是主表刚
+                        # 生成自增的 chunk_id —— 所以先取映射，再批量写侧表。
+                        # 三张表同一事务：崩溃要么全有要么全无，不会留半本书。
+                        cur.execute(
+                            "SELECT chunk_seq, chunk_id FROM documents_book_chunk "
+                            "WHERE book_guid = ?",
+                            (guid,),
+                        )
+                        id_by_seq = {int(r["chunk_seq"]): int(r["chunk_id"])
+                                     for r in cur.fetchall()}
+                        missing = [c.chunk_seq for c in chunks
+                                   if c.chunk_seq not in id_by_seq]
+                        if missing:
+                            raise RuntimeError(
+                                f"chunk_id 映射缺失 {len(missing)} 个（seq {missing[:5]}）"
+                            )
+                        fts_rows = [(id_by_seq[c.chunk_seq], tokenize_cjk_ub_v2(c.content))
+                                    for c in chunks]
+                        vec_rows = [(id_by_seq[c.chunk_seq], _emb_bytes(chunk_vecs[i]))
+                                    for i, c in enumerate(chunks)]
+                        for i in range(0, len(fts_rows), 200):
+                            cur.executemany(
+                                "INSERT INTO documents_book_chunk_fts "
+                                "(chunk_id, content_tokenized) VALUES (?, ?)",
+                                fts_rows[i : i + 200],
+                            )
+                        for i in range(0, len(vec_rows), 200):
+                            cur.executemany(
+                                "INSERT INTO documents_book_chunk_vec "
+                                "(chunk_id, embedding) VALUES (?, ?)",
+                                vec_rows[i : i + 200],
+                            )
+
                         cur.execute(
                             "UPDATE documents_book SET status = 'done' "
                             "WHERE guid = ?",

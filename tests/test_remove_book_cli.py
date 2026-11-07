@@ -34,16 +34,22 @@ def test_parse_guids_case_preserved():
 # ---------- 删除语句构造（破坏性：只列 SQL，不执行） ----------
 
 def test_build_delete_statements_sql():
+    """五条语句、顺序固定。**不再依赖任何 FK 级联**。
+
+    2026-11-07 修正：活库 documents_book_chunk 上并没有 fk_chunk_book
+    （information_schema 里只有 bucket_config 与 page_footnotes 两条外键），
+    所以原先「靠级联删 chunks」的写法实际留下过 3,109 行孤儿。垂直分表后
+    chunks 还多了 fts / vec 两张无 FK 的侧表，级联更不可能覆盖。
+    """
     stmts = rb._build_delete_statements(["g1", "g2"])
+    scope = ("SELECT chunk_id FROM documents_book_chunk "
+             "WHERE book_guid IN (?,?)")
     assert stmts == [
-        (
-            "DELETE FROM page_footnotes WHERE book_guid IN (?,?)",
-            ("g1", "g2"),
-        ),
-        (
-            "DELETE FROM documents_book WHERE guid IN (?,?)",
-            ("g1", "g2"),
-        ),
+        (f"DELETE FROM documents_book_chunk_fts WHERE chunk_id IN ({scope})", ("g1", "g2")),
+        (f"DELETE FROM documents_book_chunk_vec WHERE chunk_id IN ({scope})", ("g1", "g2")),
+        ("DELETE FROM documents_book_chunk WHERE book_guid IN (?,?)", ("g1", "g2")),
+        ("DELETE FROM page_footnotes WHERE book_guid IN (?,?)", ("g1", "g2")),
+        ("DELETE FROM documents_book WHERE guid IN (?,?)", ("g1", "g2")),
     ]
 
 
@@ -57,10 +63,13 @@ def test_build_delete_statements_parametrized():
 
 
 def test_build_delete_statements_order():
-    """先删 footnotes 再删 book（活库 footnotes 无 FK，顺序不能反）。"""
-    stmts = rb._build_delete_statements(["g1"])
-    assert stmts[0][0].startswith("DELETE FROM page_footnotes")
-    assert stmts[1][0].startswith("DELETE FROM documents_book")
+    """依赖顺序：侧表 → 主 chunk → 脚注 → 书目。反了就会留下孤儿。"""
+    stmts = [sql for sql, _ in rb._build_delete_statements(["g1"])]
+    assert stmts[0].startswith("DELETE FROM documents_book_chunk_fts")
+    assert stmts[1].startswith("DELETE FROM documents_book_chunk_vec")
+    assert stmts[2].startswith("DELETE FROM documents_book_chunk ")
+    assert stmts[3].startswith("DELETE FROM page_footnotes")
+    assert stmts[4].startswith("DELETE FROM documents_book ")
 
 
 # ---------- 未命中比对 ----------

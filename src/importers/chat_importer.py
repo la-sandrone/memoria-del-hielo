@@ -18,7 +18,7 @@ from ..core.config import get_config
 from ..core.db import get_db
 from ..core.embedding import get_embedding_service
 from ..core.tags import validate_write_tags
-from ..core.tokenizer import tokenize_cjk_ub
+from ..core.tokenizer import tokenize_cjk_ub_v2
 from ..cleaners.chat_cleaner import ChatCleaner
 
 
@@ -53,7 +53,7 @@ class ChatImporter:
         key_meta = manual_summary or self._cleaner.generate_summary(raw_text)
 
         # jieba 分词 → content_tokenized
-        text_tokenized = tokenize_cjk_ub(cleaned_text)
+        text_tokenized = tokenize_cjk_ub_v2(cleaned_text)
 
         # 嵌入（documents_chat.embedding 为 NOT NULL）
         embedding_vec = self._embedding.embed_one(cleaned_text)

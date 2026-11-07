@@ -1,11 +1,18 @@
 """
 文件名: search.py
-摘要: CJK 感知双路搜索引擎（v2: 书桶 chunk 级检索）。
-      · book 类别 → documents_book_chunk（chunk 检索 + join 书表 +
-        书级聚合：同书多 chunk 命中 → 书信号增强，每书限流展示）
-      · chat / onenote → 原有整档粒度，逻辑不变
-      · 权重不变: CJK 向量0.8/全文0.2；非CJK 全文0.6/向量0.4
-      · 向量路失败降级纯全文（原降级语义保留）
+摘要: CJK 感知三路搜索引擎（v3: 垂直分表 + 分词 v2 + NL MODE）。
+      · book 类别 → documents_book_chunk（元数据+content）
+                     + documents_book_chunk_fts（content_tokenized + FULLTEXT）
+                     + documents_book_chunk_vec（embedding + HNSW）
+                     join 书表做书级聚合（同书多 chunk 命中 → 书信号增强，每书限流）
+      · chat / onenote → 整档粒度（口径与 book 同源：v2 分词 + NL MODE）
+      · 权重: CJK 向量0.8/全文0.2；非CJK 全文0.6/向量0.4
+      · 全文路一律 NATURAL LANGUAGE MODE。BOOLEAN MODE 会把全部 bigram 用 AND
+        串起来，长查询必然 0 命中（实测本项目真实查询 5 条里 4 条 0 命中）
+      · 子串兜底（LIKE，权重 0.05）：**只在全文与向量都空时**才跑 —— 它救的是
+        「分词漏掉的词」，代价是 content 全表扫（65 万行约 16 秒）
+      · 降级不静默：某条路抛异常 → 进 search_meta.degraded；靠兜底救回 →
+        search_meta.salvaged > 0。调用方必须能区分「库里没有」与「某路挂了」
       · tag 语义在 search_documents() 单点收敛：OMNIA（哨兵）/空串 = 不过滤；
         哨兵与真 tag 混用、SQL 保留字、结构性字符 → TagSyntaxError（见 core.tags）
 依赖: core.config, core.db, core.embedding, core.tokenizer, core.tags
@@ -13,6 +20,7 @@
 
 from __future__ import annotations
 
+import re
 import statistics
 import warnings
 from typing import Any
@@ -21,7 +29,13 @@ from .config import get_config
 from .db import get_db
 from .embedding import get_embedding_service
 from .tags import normalize_query_tags, split_tags
-from .tokenizer import build_cjk_boolean, has_cjk, tokenize_query
+from .tokenizer import (
+    build_cjk_query_raw,
+    build_cjk_query_v2,
+    has_cjk,
+    iter_chunks,
+    query_term_split,
+)
 
 # 搜索表配置（book 走 chunk 表专用路径，不在此列）
 SEARCHABLE_TABLES = [
@@ -34,6 +48,13 @@ FT_WEIGHT_CJK = 0.2
 VEC_WEIGHT_CJK = 0.8
 FT_WEIGHT_ASCII = 0.6
 VEC_WEIGHT_ASCII = 0.4
+
+# 子串兜底路（LIKE）：它没有相关性信号（命中=1、不命中=0），给高了会挤掉
+# BM25/向量命中。职责只有一个 —— 救「分词漏掉的词」，因此**只在其它路全空时**
+# 才跑（见 _book_search）。代价是 content 全表扫（654,315 行 / 约 2 GiB）。
+LIKE_WEIGHT = 0.05
+# 兜底路最多用几个查询词做 OR（每多一个词不增加扫描量，但会放宽命中面）
+SALVAGE_MAX_TERMS = 3
 
 # snippet 截取长度
 SNIPPET_MAX_LEN = 200
@@ -66,6 +87,18 @@ def _fallback_target(
     if vector_only and not fulltext_only:
         return ("fulltext_only", "向量路无命中")
     return None
+
+
+def _final_rank_key(item: dict[str, Any]) -> float:
+    """最终排序键：优先 rerank 分，没有就退回融合分（都是取负排降序）。
+
+    ⚠️ 必须显式处理 None，不能写 `item.get("score_rerank", item["score"])`：
+    `dict.get(k, default)` 在**键存在且值为 None** 时返回 None，而 _book_search
+    在 rerank 没跑成时会显式把 score_rerank 设成 None ⟹ `-None` 抛 TypeError
+    ⟹ **rerank 服务一挂，整次检索从「降级」变成「崩溃」**。
+    """
+    rerank = item.get("score_rerank")
+    return -(rerank if rerank is not None else item.get("score", 0.0))
 
 
 def _get_snippet(text: str) -> str:
@@ -176,15 +209,30 @@ class SearchEngine:
         vec_w = VEC_WEIGHT_CJK if is_cjk else VEC_WEIGHT_ASCII
 
         results: list[dict[str, Any]] = []
+        # 本轮「哪条路挂了」（degraded）与「有没有靠子串兜底救回」（salvaged）
+        # 都必须能让调用方看见 —— 否则「某路抛异常」和「库里没有」是同一个现象。
+        degraded: list[dict[str, Any]] = []
+        salvaged = 0
+        retried_unpruned = False
+
+        # 剪枝的可见性：把「留下了什么、剪掉了什么」交给调用方。
+        # 剪枝率异常（剪掉的 ≥ 留下的）说明词表与语料脱节 —— 那是最激进也最危险的时刻。
+        kept_terms, pruned_terms = query_term_split(query)
+        if pruned_terms and len(pruned_terms) >= len(kept_terms):
+            warnings.warn(
+                f"停词剪枝比例过高：剪掉 {len(pruned_terms)} 个、保留 {len(kept_terms)} 个"
+                f"（query={query[:40]!r}）—— 词表可能与语料脱节"
+            )
 
         # ── book 路径（chunk 级 + 书级聚合）────────────────
         if category in (None, "book"):
-            results.extend(
-                self._book_search(
-                    query, bucket, tags, limit,
-                    fulltext_only, vector_only, is_cjk, ft_w, vec_w,
-                )
+            book_results, book_stats = self._book_search(
+                query, bucket, tags, limit,
+                fulltext_only, vector_only, ft_w, vec_w, degraded,
             )
+            results.extend(book_results)
+            salvaged = book_stats.get("salvaged", 0)
+            retried_unpruned = book_stats.get("retried_unpruned", False)
 
         # ── chat / onenote 路径（整档粒度，逻辑不变）───────
         tables = [
@@ -195,13 +243,13 @@ class SearchEngine:
             results.extend(
                 self._other_search(
                     tables, query, bucket, tags, limit,
-                    fulltext_only, vector_only, ft_w, vec_w,
+                    fulltext_only, vector_only, ft_w, vec_w, degraded,
                 )
             )
 
         # 最终排序：book 结果尊重 rerank 精排（score_rerank 跨书可比），
         # chat/onenote 及 rerank 降级场景回退原融合分
-        results.sort(key=lambda x: -x.get("score_rerank", x["score"]))
+        results.sort(key=_final_rank_key)
         results = results[:limit]
 
         # 显式单路无命中 → 补另一路，并留下标注（不静默空手）
@@ -222,7 +270,20 @@ class SearchEngine:
             mode = "fulltext_only" if fulltext_only else ("vector_only" if vector_only else "hybrid")
             return {
                 "results": results,
-                "search_meta": {"mode": mode, "returned": len(results), "fallback": fallback},
+                "search_meta": {
+                    "mode": mode,
+                    "returned": len(results),
+                    "fallback": fallback,
+                    # 非空 = 某条路抛异常了，结果可能是残的（别当「库里没有」）
+                    "degraded": degraded,
+                    # >0 = FULLTEXT 与向量都没打中，是 LIKE 子串兜底救回来的
+                    "salvaged": salvaged,
+                    # True = 剪枝后 0 命中，已用未剪词表重试过（词表可能太激进）
+                    "retried_unpruned": retried_unpruned,
+                    # 剪枝的可见性：kept 是实际用的词；pruned 是词表想丢的词。
+                    # 若 len(pruned) >= len(kept)，说明词表几乎丢光了查询 —— 那条会打 WARNING。
+                    "query_terms": {"kept": kept_terms, "pruned": pruned_terms},
+                },
             }
         return results
 
@@ -260,15 +321,29 @@ class SearchEngine:
         limit: int,
         fulltext_only: bool,
         vector_only: bool,
-        is_cjk: bool,
         ft_w: float,
         vec_w: float,
-    ) -> list[dict[str, Any]]:
+        degraded: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """book 路径：全文路 + 向量路 + 子串兜底。
+
+        返回 (结果, stats)，stats = {salvaged: 兜底救回条数, retried_unpruned: 是否重试过}。
+        """
         # 全文路（chunk 级）
         ft_rows: dict[int, dict[str, Any]] = {}
+        retried_unpruned = False
         if not vector_only:
-            for row in self._book_fulltext(query, bucket, tags, limit, is_cjk):
+            for row in self._book_fulltext(query, bucket, tags, limit, degraded):
                 ft_rows.setdefault(row["chunk_id"], row)
+            # 第二层重试：剪枝后 0 命中 —— 剪枝可能正是漏召回的原因。
+            # 剪枝只许削弱精度，绝不许影响「能不能捞到」，所以这里宁可带冗余词重打一次。
+            if not ft_rows and query_term_split(query)[1]:
+                retried_unpruned = True
+                warnings.warn("停词剪枝后全文路 0 命中，已用未剪词表重试")
+                for row in self._book_fulltext(
+                    query, bucket, tags, limit, degraded, prune=False
+                ):
+                    ft_rows.setdefault(row["chunk_id"], row)
 
         # 向量路（chunk 级）
         vec_rows: dict[int, dict[str, Any]] = {}
@@ -277,9 +352,10 @@ class SearchEngine:
                 query_vec = self._embedding.embed_one(query)
             except Exception as exc:
                 warnings.warn(f"向量搜索失败，降级为纯全文: {exc}")
+                degraded.append({"route": "embed", "reason": str(exc)[:200]})
                 query_vec = None
             if query_vec is not None:
-                for row in self._book_vector(query_vec, bucket, tags, limit):
+                for row in self._book_vector(query_vec, bucket, tags, limit, degraded):
                     vec_rows.setdefault(row["chunk_id"], row)
 
         # 合并（与整档路径同一套权重逻辑，key = chunk_id）
@@ -303,6 +379,18 @@ class SearchEngine:
             merged[cid] = self._chunk_row_to_result(
                 base, s_ft, s_vec, combined, source
             )
+
+        # 全部路都空 → 子串兜底（只在此刻付出 content 全表扫的代价）
+        salvaged = 0
+        if not merged:
+            for row in self._book_like(query, bucket, tags, limit, degraded):
+                merged.setdefault(
+                    row["chunk_id"],
+                    self._chunk_row_to_result(row, 0.0, 0.0, LIKE_WEIGHT, "like"),
+                )
+                salvaged += 1
+            if salvaged:
+                warnings.warn(f"全文与向量路均无命中，子串兜底救回 {salvaged} 条")
 
         # 书级聚合：同书多 chunk 命中 → 书信号增强
         books: dict[str, dict[str, Any]] = {}
@@ -349,7 +437,7 @@ class SearchEngine:
                 item["book_score"] = round(info["score"], 4)
                 item["score_rerank"] = item.get("_rerank_score")
                 output.append(item)
-        return output
+        return output, {"salvaged": salvaged, "retried_unpruned": retried_unpruned}
 
     def _rerank_chunks(
         self, query: str, books: dict[str, dict[str, Any]]
@@ -383,29 +471,45 @@ class SearchEngine:
         bucket: str | None,
         tags: str | None,
         limit: int,
-        is_cjk: bool,
+        degraded: list[dict[str, Any]],
+        prune: bool = True,
     ) -> list[dict[str, Any]]:
-        """书桶全文搜索（chunk 级）。
+        r"""书桶全文搜索（chunk 级）：侧表 + NATURAL LANGUAGE MODE。
 
-        CJK 查询 → jieba 分词后搜 content_tokenized 列（布尔模式）
-        非 CJK   → 搜 content 列（布尔模式）
+        口径（2026-11-07 改）：
+          · 查询串一律 build_cjk_query_v2 —— 汉字只给 bigram、非汉字给整词、
+            过停词表；**不带 `+` / `*` 操作符**（那是 BOOLEAN 语法）。
+          · 走 NATURAL LANGUAGE MODE。BOOLEAN MODE 把所有 bigram 用 AND 串起来，
+            要求**同一条 chunk 同时含全部分词** —— 长查询必然落空。本项目真实
+            查询实测（docs/真实检索查询分布案例.md 那 190 条的形态）：
+              「卡尔萨根 魔鬼出没的世界 科学 迷信 伪科学」  BOOLEAN 0 命中
+                                                            NL 41,387 命中，top-1 对
+              「克尔度规 零测地线 Carter 常数 分离变量」      BOOLEAN 0 命中
+                                                            NL 17,549 命中，top-1 对
+              「helium 3D excitation electron impact cross section」
+                                                            BOOLEAN 0 命中，NL 14,260
+            5 条里 4 条 0 命中 —— 「快」是因为它什么都没查。
+          · CJK 与非 CJK 都打 content_tokenized：它是 content 的投影，拉丁词在
+            里面是整词（tokenize_cjk_ub_v2 的 \w+ 分支），所以 content 上的
+            那个 FULLTEXT 索引已无存在理由 → 迁移时退役（省约 4.6 GB）。
         """
-        # CJK 走 unigram+bigram（与 content_tokenized 的写入口径一致）；
-        # 非 CJK 仍走原分词（那些列存的是整词，未 bigram 化）
-        tokens = build_cjk_boolean(query) if is_cjk else tokenize_query(query)
+        # prune=True ：正常口径（剪掉纯虚词的 bigram）
+        # prune=False：**第二层重试**——剪枝可能是 0 命中的原因，此时宁可多带冗余词
+        #              也不能漏召回（拿回召回换一点精度，这笔账永远划算）
+        tokens = build_cjk_query_v2(query) if prune else build_cjk_query_raw(query)
         if not tokens.strip():
             return []
 
-        col = "c.content_tokenized" if is_cjk else "c.content"
         sql = (
             f"SELECT c.chunk_id, c.book_guid, c.chunk_seq, c.heading_path, "
             f"  IF(c.has_pua, SUBSTRING(b.content, c.char_start + 1, c.char_len), c.content) AS content, "
-            f"  MATCH({col}) AGAINST(? IN BOOLEAN MODE) AS _score, "
+            f"  MATCH(f.content_tokenized) AGAINST(? IN NATURAL LANGUAGE MODE) AS _score, "
             f"  b.key_metadata AS book_title, b.bucket, b.tags, "
             f"  b.source_path AS book_path "
-            f"FROM documents_book_chunk c "
+            f"FROM documents_book_chunk_fts f "
+            f"JOIN documents_book_chunk c ON c.chunk_id = f.chunk_id "
             f"JOIN documents_book b ON b.guid = c.book_guid "
-            f"WHERE MATCH({col}) AGAINST(? IN BOOLEAN MODE)"
+            f"WHERE MATCH(f.content_tokenized) AGAINST(? IN NATURAL LANGUAGE MODE)"
         )
         params: list[Any] = [tokens, tokens]
 
@@ -425,7 +529,10 @@ class SearchEngine:
         try:
             return self._db.execute_sql(sql, params)
         except Exception as exc:
+            # 不静默：既要警告（日志/CLI 可见），也要进 degraded（MCP 调用方可见）。
+            # 「某路挂了」与「库里没有」必须能被区分开。
             warnings.warn(f"书桶全文搜索失败: {exc}")
+            degraded.append({"route": "fulltext", "reason": str(exc)[:200]})
             return []
 
     def _book_vector(
@@ -434,8 +541,9 @@ class SearchEngine:
         bucket: str | None,
         tags: str | None,
         limit: int,
+        degraded: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
-        """书桶向量搜索（chunk 级）。
+        """书桶向量搜索（chunk 级，向量已搬到侧表 documents_book_chunk_vec）。
 
         两个必须保留的形状约束（改这条 SQL 前先跑向量基准复测）：
         1. 查询向量放进派生表解析一次：`(SELECT VEC_FromText(?) AS qv) q`。
@@ -446,6 +554,13 @@ class SearchEngine:
            （实测 6.06s vs 0.39s，13×）。
         JOIN 会让向量索引失效、走精确扫描——但精确扫描在 8G 缓冲池下已是 0.4s，
         且结果是精确 KNN（无近似损失、无候选数上限），故不需要 ANN/两阶段方案。
+
+        分表后（2026-11-07）：向量落在 documents_book_chunk_vec，侧表一行只有
+        (chunk_id, embedding) = 用户口径的 4 KB，而原先它躺在行宽约 10.6 KB 的
+        主表里（content 3.3KB + tokenized 3.2KB + 向量 4KB，一个 16KB 页只装 ~1.5 行）。
+        精确扫描要读的字节数因此降到约 1/3，且缓冲池不再被无关列挤占。
+        形状不变（仍带 JOIN → 仍走精确扫描），所以这是**纯粹的变快**，不引入
+        近似召回损失。
         """
         # **⚠️ 这是近似检索（ANN），结果不保证精确**
         #
@@ -475,8 +590,9 @@ class SearchEngine:
             f"  IF(c.has_pua, SUBSTRING(b.content, c.char_start + 1, c.char_len), c.content) AS content, "
             f"  t._distance, b.key_metadata AS book_title, b.bucket, b.tags, "
             f"  b.source_path AS book_path "
-            f"FROM (SELECT c2.chunk_id AS cid, VEC_DISTANCE_COSINE(c2.embedding, q.qv) AS _distance "
-            f"        FROM documents_book_chunk c2 "
+            f"FROM (SELECT v.chunk_id AS cid, VEC_DISTANCE_COSINE(v.embedding, q.qv) AS _distance "
+            f"        FROM documents_book_chunk_vec v "
+            f"        JOIN documents_book_chunk c2 ON c2.chunk_id = v.chunk_id "
             f"        JOIN documents_book b2 ON b2.guid = c2.book_guid, "
             f"             (SELECT VEC_FromText(?) AS qv) q "
         )
@@ -507,7 +623,82 @@ class SearchEngine:
             return self._db.execute_sql(sql, params)
         except Exception as exc:
             warnings.warn(f"书桶向量搜索失败: {exc}")
+            degraded.append({"route": "vector", "reason": str(exc)[:200]})
             return []
+
+    def _book_like(
+        self,
+        query: str,
+        bucket: str | None,
+        tags: str | None,
+        limit: int,
+        degraded: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """子串兜底（LIKE）：**只在其它路全空时**才跑。
+
+        为什么要它：分词漏掉的词，FULLTEXT 与向量都救不回来。典型是「拉丁紧邻
+        汉字」的串（v1 把它们整段吞进一个 token，抽样 19.6% 的行受影响）。迁移会
+        修掉存量，但新型混合串还会有 —— 兜底路是兜底，不是主路。
+
+        为什么只在全空时跑：`LIKE '%词%'` 在 content 上用不了索引，是全表扫
+        （654,315 行 / 约 2 GiB）。常态查询付不起这个代价；空手而归时才值得付。
+
+        为什么权重只有 LIKE_WEIGHT=0.05：布尔子串**没有相关性信号**（命中=1、
+        不命中=0）。给高了会把 BM25/向量的好结果挤下去 —— melquiades 那场实测过，
+        LIKE 以 score=1.0 参与排序时会抢占 BM25/向量命中。
+
+        为什么按 LENGTH(content) 排序：子串命中没有相关性可言，但「更短的 chunk」
+        是唯一廉价的焦点代理。按 guid / chunk_id 排序等于随机（会把无关长段落排前面）。
+        """
+        terms = self._salvage_terms(query)
+        if not terms:
+            return []
+        like_sql = " OR ".join(["c.content LIKE ?" for _ in terms])
+        params: list[Any] = [f"%{t}%" for t in terms]
+
+        sql = (
+            f"SELECT c.chunk_id, c.book_guid, c.chunk_seq, c.heading_path, "
+            f"  IF(c.has_pua, SUBSTRING(b.content, c.char_start + 1, c.char_len), c.content) AS content, "
+            f"  b.key_metadata AS book_title, b.bucket, b.tags, b.source_path AS book_path "
+            f"FROM documents_book_chunk c "
+            f"JOIN documents_book b ON b.guid = c.book_guid "
+            f"WHERE ({like_sql})"
+        )
+        if bucket:
+            sql += " AND b.bucket = ?"
+            params.append(bucket)
+        if tags:
+            tag_list = [t.strip() for t in tags.split(",") if t.strip()]
+            if tag_list:
+                conds = " OR ".join(["FIND_IN_SET(?, b.tags)" for _ in tag_list])
+                sql += f" AND ({conds})"
+                params.extend(tag_list)
+        sql += " ORDER BY LENGTH(c.content) ASC, c.chunk_id ASC LIMIT ?"
+        params.append(limit * 3)
+
+        try:
+            return self._db.execute_sql(sql, params)
+        except Exception as exc:
+            warnings.warn(f"子串兜底搜索失败: {exc}")
+            degraded.append({"route": "like", "reason": str(exc)[:200]})
+            return []
+
+    @staticmethod
+    def _salvage_terms(query: str) -> list[str]:
+        """挑做子串匹配的词：最长的 CJK 串 / ≥3 字符的拉丁词，最多 SALVAGE_MAX_TERMS 个。
+
+        单字做 LIKE 会命中半个库。拉丁侧跨语种子串本来就无意义（用户口径：
+        「跨语种 LIKE 显然没办法」），故只保留长度 ≥3 的词。
+        """
+        cjk: list[str] = []
+        latin: list[str] = []
+        for is_cjk, seg in iter_chunks(query):
+            if is_cjk:
+                if len(seg) >= 2:
+                    cjk.append(seg)
+            else:
+                latin.extend(re.findall(r"[A-Za-z][A-Za-z0-9_+-]{2,}", seg))
+        return sorted(set(cjk + latin), key=len, reverse=True)[:SALVAGE_MAX_TERMS]
 
     @staticmethod
     def _chunk_row_to_result(
@@ -551,6 +742,7 @@ class SearchEngine:
         vector_only: bool,
         ft_w: float,
         vec_w: float,
+        degraded: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
         ft_results: dict[str, dict[str, Any]] = {}
         vec_results: dict[str, dict[str, Any]] = {}
@@ -558,7 +750,7 @@ class SearchEngine:
         # 全文搜索
         if not vector_only:
             for tbl in tables:
-                rows = self._fulltext_search(tbl, query, bucket, tags, limit)
+                rows = self._fulltext_search(tbl, query, bucket, tags, limit, degraded)
                 for row in rows:
                     g = row["guid"]
                     if g not in ft_results:
@@ -573,9 +765,10 @@ class SearchEngine:
                     query_vec = self._embedding.embed_one(query)
                 except Exception as exc:
                     warnings.warn(f"向量搜索失败，降级为纯全文: {exc}")
+                    degraded.append({"route": "embed", "reason": str(exc)[:200]})
                     vec_tables = []
                 for tbl in vec_tables:
-                    rows = self._vector_search(tbl, query_vec, bucket, tags, limit)
+                    rows = self._vector_search(tbl, query_vec, bucket, tags, limit, degraded)
                     for row in rows:
                         g = row["guid"]
                         if g not in vec_results:
@@ -631,20 +824,20 @@ class SearchEngine:
         bucket: str | None,
         tags: str | None,
         limit: int,
+        degraded: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
-        is_cjk = has_cjk(query)
-        tokens = build_cjk_boolean(query) if is_cjk else tokenize_query(query)
+        # 与 book 路径同一口径：build_cjk_query_v2 + NATURAL LANGUAGE MODE。
+        # （chat/onenote 目前 0 行，但口径必须同源，否则一启用就是「搜不到」。）
+        tokens = build_cjk_query_v2(query)
         if not tokens.strip():
             return []
 
-        col = "content_tokenized" if is_cjk else "content"
         table = tbl["table"]
-
         sql = (
             f"SELECT guid, bucket, tags, key_metadata, content, "
-            f"  MATCH({col}) AGAINST(? IN BOOLEAN MODE) AS _score "
+            f"  MATCH(content_tokenized) AGAINST(? IN NATURAL LANGUAGE MODE) AS _score "
             f"FROM {table} "
-            f"WHERE MATCH({col}) AGAINST(? IN BOOLEAN MODE)"
+            f"WHERE MATCH(content_tokenized) AGAINST(? IN NATURAL LANGUAGE MODE)"
         )
         params: list[Any] = [tokens, tokens]
 
@@ -665,6 +858,7 @@ class SearchEngine:
             return self._db.execute_sql(sql, params)
         except Exception as exc:
             warnings.warn(f"全文搜索失败 [{table}]: {exc}")
+            degraded.append({"route": f"fulltext:{table}", "reason": str(exc)[:200]})
             return []
 
     def _vector_search(
@@ -674,6 +868,7 @@ class SearchEngine:
         bucket: str | None,
         tags: str | None,
         limit: int,
+        degraded: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
         # **⚠️ 这是近似检索（ANN），结果不保证精确**
         #
@@ -729,6 +924,7 @@ class SearchEngine:
             return self._db.execute_sql(sql, params)
         except Exception as exc:
             warnings.warn(f"向量搜索失败 [{table}]: {exc}")
+            degraded.append({"route": f"vector:{table}", "reason": str(exc)[:200]})
             return []
 
 
